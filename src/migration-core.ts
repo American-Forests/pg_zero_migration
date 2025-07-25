@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 /**
  * Database Migration Core Module
  *
@@ -796,19 +797,48 @@ export class DatabaseMigrator {
   /**
    * Phase 2A: Setup preserved table synchronization
    */
-  private async setupPreservedTableSync(): Promise<void> {
+  private async setupPreservedTableSync(destTables: TableInfo[], timestamp: number): Promise<void> {
     if (this.preservedTables.size === 0) {
       this.log('✅ No preserved tables to sync');
       return;
     }
 
-    this.log('🔄 Phase 2A: Setting up preserved table synchronization...');
+    this.log(`🔄 Phase 2A: Setting up preserved table synchronization (backup_${timestamp})...`);
+
+    // Validate preserved tables exist in destination schema
+    const missingTables = [];
+    for (const preservedTableName of this.preservedTables) {
+      const tableExists = destTables.some(
+        table => table.tableName.toLowerCase() === preservedTableName.toLowerCase()
+      );
+      if (!tableExists) {
+        missingTables.push(preservedTableName);
+      }
+    }
+
+    if (missingTables.length > 0) {
+      throw new Error(`Preserved tables not found in destination: ${missingTables.join(', ')}`);
+    }
 
     const client = await this.destPool.connect();
 
     try {
       for (const tableName of this.preservedTables) {
-        // Check if table exists in destination
+        // Get table info from destTables for better validation
+        const tableInfo = destTables.find(
+          table => table.tableName.toLowerCase() === tableName.toLowerCase()
+        );
+
+        if (!tableInfo) {
+          this.log(`⚠️  Preserved table ${tableName} not found in destination schema, skipping`);
+          continue;
+        }
+
+        this.log(
+          `🔄 Setting up sync for preserved table: ${tableName} (${tableInfo.columns.length} columns)`
+        );
+
+        // Verify table exists in destination database (double-check)
         const tableExists = await client.query(
           `
           SELECT EXISTS (
@@ -821,8 +851,6 @@ export class DatabaseMigrator {
         );
 
         if (tableExists.rows[0].exists) {
-          this.log(`🔄 Setting up sync for preserved table: ${tableName}`);
-
           // Step 1: Clear shadow table and copy current data
           await client.query(`DELETE FROM shadow."${tableName}"`);
           await client.query(
@@ -831,6 +859,7 @@ export class DatabaseMigrator {
 
           // Step 2: Setup real-time sync triggers
           const triggerInfo = await this.createRealtimeSyncTrigger(client, tableName);
+          triggerInfo.checksum = `sync_${timestamp}`; // Use timestamp for tracking
           this.activeSyncTriggers.push(triggerInfo);
 
           // Step 3: Validate initial sync
@@ -843,14 +872,14 @@ export class DatabaseMigrator {
 
           this.log(`✅ Sync setup complete for ${tableName} (${validation.sourceRowCount} rows)`);
         } else {
-          this.log(
-            `⚠️  Preserved table ${tableName} not found in destination, skipping sync setup`
+          throw new Error(
+            `Preserved table ${tableName} exists in schema analysis but not in actual database`
           );
         }
       }
 
       this.log(
-        `✅ Real-time sync setup complete for ${this.activeSyncTriggers.length} preserved tables`
+        `✅ Real-time sync setup complete for ${this.activeSyncTriggers.length} preserved tables (backup_${timestamp})`
       );
     } catch (error) {
       // Cleanup any triggers created so far
@@ -939,13 +968,15 @@ export class DatabaseMigrator {
   /**
    * Phase 4: Cleanup sync triggers and validate consistency
    */
-  private async cleanupSyncTriggersAndValidate(): Promise<void> {
+  private async cleanupSyncTriggersAndValidate(timestamp: number): Promise<void> {
     if (this.activeSyncTriggers.length === 0) {
       this.log('✅ No sync triggers to cleanup');
       return;
     }
 
-    this.log('🧹 Phase 4: Cleaning up sync triggers and validating consistency...');
+    this.log(
+      `🧹 Phase 4: Cleaning up sync triggers and validating consistency (backup_${timestamp})...`
+    );
 
     try {
       // Validate sync consistency before cleanup
@@ -977,7 +1008,7 @@ export class DatabaseMigrator {
       // Cleanup triggers
       await this.cleanupRealtimeSync(this.activeSyncTriggers);
 
-      this.log('✅ Sync triggers cleaned up and validation complete');
+      this.log(`✅ Sync triggers cleaned up and validation complete (backup_${timestamp})`);
     } catch (error) {
       // Ensure triggers are cleaned up even if validation fails
       try {
