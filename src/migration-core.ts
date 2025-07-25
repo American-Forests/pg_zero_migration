@@ -468,6 +468,9 @@ export class DatabaseMigrator {
       this.log('🗂️  Phase 6: Recreating indexes...');
       await this.recreateIndexes(sourceTables);
 
+      // Disable destination write protection after all critical phases complete
+      await this.disableDestinationWriteProtection();
+
       this.log('✅ Zero-downtime migration finished successfully');
       this.log(`📦 Original schema preserved in backup_${timestamp} schema`);
       this.log('💡 Call cleanupBackupSchema(timestamp) to remove backup after verification');
@@ -482,6 +485,13 @@ export class DatabaseMigrator {
         }
       } catch (cleanupError) {
         this.logError('Warning: Could not cleanup sync triggers', cleanupError);
+      }
+
+      // Ensure destination write protection is disabled on error
+      try {
+        await this.disableDestinationWriteProtection();
+      } catch (cleanupError) {
+        this.logError('Warning: Could not disable destination write protection', cleanupError);
       }
 
       this.log('🔄 Attempting automatic rollback via schema swap...');
@@ -508,6 +518,9 @@ export class DatabaseMigrator {
     const client = await this.destPool.connect();
 
     try {
+      // Enable write protection on destination database at the start of Phase 1
+      await this.enableDestinationWriteProtection();
+
       // Disable foreign key constraints for the destination database during setup
       await this.disableForeignKeyConstraints(this.destPool);
 
@@ -1526,6 +1539,100 @@ export class DatabaseMigrator {
       this.log('✅ Write protection removed from all source tables');
     } catch (error) {
       this.logError('Failed to disable write protection', error);
+      // Don't throw here - we want to continue even if cleanup fails
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Enable write protection on destination database tables to prevent data modification during migration
+   * Uses triggers that block INSERT/UPDATE/DELETE operations while allowing schema operations
+   */
+  private async enableDestinationWriteProtection(): Promise<void> {
+    this.log('🔒 Enabling write protection on destination database tables...');
+
+    const client = await this.destPool.connect();
+    try {
+      // Create a function that blocks writes
+      await client.query(`
+        CREATE OR REPLACE FUNCTION migration_block_writes()
+        RETURNS TRIGGER AS $$
+        BEGIN
+          RAISE EXCEPTION 'Data modification blocked during migration process'
+            USING ERRCODE = 'P0001',
+                  HINT = 'Migration in progress - please wait';
+          RETURN NULL;
+        END;
+        $$ LANGUAGE plpgsql;
+      `);
+
+      // Get all user tables (excluding system tables)
+      const result = await client.query(`
+        SELECT tablename 
+        FROM pg_tables 
+        WHERE schemaname = 'public'
+      `);
+
+      // Create triggers on all tables to block writes
+      for (const row of result.rows) {
+        const tableName = row.tablename;
+        const triggerName = `migration_write_block_${tableName}`;
+
+        await client.query(`
+          CREATE TRIGGER ${triggerName}
+          BEFORE INSERT OR UPDATE OR DELETE ON "${tableName}"
+          FOR EACH ROW
+          EXECUTE FUNCTION migration_block_writes();
+        `);
+
+        this.log(`🔒 Write protection enabled for destination table: ${tableName}`);
+      }
+
+      this.log('✅ Write protection enabled on all destination tables');
+    } catch (error) {
+      this.logError('Failed to enable destination write protection', error);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Disable write protection on destination database tables to restore normal operations
+   */
+  private async disableDestinationWriteProtection(): Promise<void> {
+    this.log('🔓 Removing write protection from destination database tables...');
+
+    const client = await this.destPool.connect();
+    try {
+      // Get all user tables
+      const result = await client.query(`
+        SELECT tablename 
+        FROM pg_tables 
+        WHERE schemaname = 'public'
+      `);
+
+      // Drop triggers from all tables
+      for (const row of result.rows) {
+        const tableName = row.tablename;
+        const triggerName = `migration_write_block_${tableName}`;
+
+        try {
+          await client.query(`DROP TRIGGER IF EXISTS ${triggerName} ON "${tableName}";`);
+          this.log(`🔓 Write protection removed from destination table: ${tableName}`);
+        } catch (error) {
+          // Log but don't fail if trigger doesn't exist
+          this.log(`⚠️  Could not remove trigger from ${tableName}: ${error}`);
+        }
+      }
+
+      // Clean up the blocking function
+      await client.query('DROP FUNCTION IF EXISTS migration_block_writes();');
+
+      this.log('✅ Write protection removed from all destination tables');
+    } catch (error) {
+      this.logError('Failed to disable destination write protection', error);
       // Don't throw here - we want to continue even if cleanup fails
     } finally {
       client.release();
