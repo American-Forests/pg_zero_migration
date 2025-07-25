@@ -1,6 +1,6 @@
 /**
  * Tests for DbTestLoader
- * 
+ *
  * These tests focus on the core functionality of the DbTestLoader class.
  * Database operations are mocked to test logic without requiring a real database.
  */
@@ -9,12 +9,12 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { readFile } from 'fs/promises';
 import { existsSync } from 'fs';
 import path from 'path';
-import { 
-  DbTestLoader, 
-  DatabaseConnectionError, 
-  SchemaSetupError, 
+import {
+  DbTestLoader,
+  DatabaseConnectionError,
+  SchemaSetupError,
   DataLoadingError,
-  PrismaError 
+  PrismaError,
 } from './db-test-loader.js';
 
 // Mock dependencies with proper hoisting
@@ -22,18 +22,18 @@ vi.mock('pg', () => ({
   Client: vi.fn(() => ({
     connect: vi.fn(),
     end: vi.fn(),
-    query: vi.fn()
-  }))
+    query: vi.fn(),
+  })),
 }));
 vi.mock('@prisma/client');
 vi.mock('execa', () => ({
-  execa: vi.fn()
+  execa: vi.fn(),
 }));
 vi.mock('fs/promises', () => ({
-  readFile: vi.fn()
+  readFile: vi.fn(),
 }));
 vi.mock('fs', () => ({
-  existsSync: vi.fn()
+  existsSync: vi.fn(),
 }));
 
 describe('DbTestLoader', () => {
@@ -43,18 +43,37 @@ describe('DbTestLoader', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    
+
     // Mock file system operations
     vi.mocked(existsSync).mockReturnValue(true);
-    vi.mocked(readFile).mockResolvedValue(JSON.stringify({
-      users: [
-        { id: 1, name: "John Doe", email: "john@example.com", created_at: "2023-01-01T00:00:00Z" },
-        { id: 2, name: "Jane Smith", email: "jane@example.com", created_at: "2023-01-02T00:00:00Z" }
-      ],
-      posts: [
-        { id: 101, title: "First Post", content: "Content", user_id: 1, published: true, created_at: "2023-01-01T12:00:00Z" }
-      ]
-    }));
+    vi.mocked(readFile).mockResolvedValue(
+      JSON.stringify({
+        users: [
+          {
+            id: 1,
+            name: 'John Doe',
+            email: 'john@example.com',
+            created_at: '2023-01-01T00:00:00Z',
+          },
+          {
+            id: 2,
+            name: 'Jane Smith',
+            email: 'jane@example.com',
+            created_at: '2023-01-02T00:00:00Z',
+          },
+        ],
+        posts: [
+          {
+            id: 101,
+            title: 'First Post',
+            content: 'Content',
+            user_id: 1,
+            published: true,
+            created_at: '2023-01-01T12:00:00Z',
+          },
+        ],
+      })
+    );
   });
 
   afterEach(() => {
@@ -93,7 +112,7 @@ describe('DbTestLoader', () => {
     it('should preserve error causes', () => {
       const originalError = new Error('Original error');
       const wrappedError = new DatabaseConnectionError('Wrapped error', originalError);
-      
+
       expect(wrappedError.cause).toBe(originalError);
     });
   });
@@ -110,7 +129,7 @@ describe('DbTestLoader', () => {
   describe('fixture data handling', () => {
     it('should handle empty fixture data', () => {
       vi.mocked(readFile).mockResolvedValue(JSON.stringify({}));
-      
+
       const loader = new DbTestLoader(testDatabaseUrl, testSchemaPath, testFixturePath);
       expect(loader).toBeInstanceOf(DbTestLoader);
     });
@@ -139,11 +158,11 @@ describe('DbTestLoader', () => {
     it('should handle tables with no records', () => {
       const fixtureData = {
         users: [],
-        posts: []
+        posts: [],
       };
-      
+
       vi.mocked(readFile).mockResolvedValue(JSON.stringify(fixtureData));
-      
+
       const loader = new DbTestLoader(testDatabaseUrl, testSchemaPath, testFixturePath);
       expect(loader).toBeInstanceOf(DbTestLoader);
     });

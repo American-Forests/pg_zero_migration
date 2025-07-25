@@ -1,0 +1,38 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Format Code",
+      "type": "shell",
+      "command": "yarn",
+      "args": ["format"],
+      "group": "build",
+      "presentation": {
+        "reveal": "silent"
+      }
+    },
+    {
+      "label": "Lint Code",
+      "type": "shell",
+      "command": "yarn",
+      "args": ["lint"],
+      "group": "build",
+      "problemMatcher": ["$eslint-stylish"]
+    },
+    {
+      "label": "Lint and Fix",
+      "type": "shell",
+      "command": "yarn",
+      "args": ["lint:fix"],
+      "group": "build",
+      "problemMatcher": ["$eslint-stylish"]
+    },
+    {
+      "label": "Check Formatting",
+      "type": "shell",
+      "command": "yarn",
+      "args": ["format:check"],
+      "group": "test"
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+dist/
+node_modules/
+*.json
+*.md
+yarn.lock
+package-lock.json

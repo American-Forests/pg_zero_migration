@@ -14,15 +14,15 @@ async function basicMigration() {
     port: 5432,
     database: 'tes_app',
     user: 'migration_user',
-    password: 'secure_password'
+    password: 'secure_password',
   };
 
   const destConfig = {
-    host: 'dest-db.example.com', 
+    host: 'dest-db.example.com',
     port: 5432,
     database: 'tes_app_new',
     user: 'migration_user',
-    password: 'secure_password'
+    password: 'secure_password',
   };
 
   const migrator = new DatabaseMigrator(sourceConfig, destConfig);
@@ -36,29 +36,20 @@ async function migrationWithPreservedTables() {
     port: 5432,
     database: 'tes_app_old',
     user: 'migration_user',
-    password: 'secure_password'
+    password: 'secure_password',
   };
-  
+
   const destConfig = {
-    host: 'dest-db.example.com', 
+    host: 'dest-db.example.com',
     port: 5432,
     database: 'tes_app_new',
     user: 'migration_user',
-    password: 'secure_password'
-  };  // Preserve authentication and session data
-  const preservedTables = [
-    'users',
-    'sessions', 
-    'tokens',
-    '_prisma_migrations'
-  ];
+    password: 'secure_password',
+  }; // Preserve authentication and session data
+  const preservedTables = ['users', 'sessions', 'tokens', '_prisma_migrations'];
 
-  const migrator = new DatabaseMigrator(
-    sourceConfig, 
-    destConfig, 
-    preservedTables
-  );
-  
+  const migrator = new DatabaseMigrator(sourceConfig, destConfig, preservedTables);
+
   await migrator.migrate();
 }
 
@@ -69,33 +60,24 @@ async function dryRunAnalysis() {
     port: parseInt(process.env.SOURCE_DB_PORT || '5432'),
     database: process.env.SOURCE_DB_NAME || 'tes_dev',
     user: process.env.SOURCE_DB_USER || 'postgres',
-    password: process.env.SOURCE_DB_PASSWORD || ''
+    password: process.env.SOURCE_DB_PASSWORD || '',
   };
 
   const destConfig = {
     host: process.env.DEST_DB_HOST || 'localhost',
-    port: parseInt(process.env.DEST_DB_PORT || '5432'), 
+    port: parseInt(process.env.DEST_DB_PORT || '5432'),
     database: process.env.DEST_DB_NAME || 'tes_staging',
     user: process.env.DEST_DB_USER || 'postgres',
-    password: process.env.DEST_DB_PASSWORD || ''
+    password: process.env.DEST_DB_PASSWORD || '',
   };
 
   const preservedTables = (process.env.PRESERVED_TABLES || '').split(',');
   const dryRun = true; // Enable dry run mode
 
-  const migrator = new DatabaseMigrator(
-    sourceConfig,
-    destConfig, 
-    preservedTables,
-    dryRun
-  );
+  const migrator = new DatabaseMigrator(sourceConfig, destConfig, preservedTables, dryRun);
 
   await migrator.migrate();
 }
 
 // Export examples for use in other scripts
-export {
-  basicMigration,
-  migrationWithPreservedTables,
-  dryRunAnalysis
-};
+export { basicMigration, migrationWithPreservedTables, dryRunAnalysis };
