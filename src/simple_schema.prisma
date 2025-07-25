@@ -1,0 +1,53 @@
+// Prisma schema generated from test_db_test_fixture_loader.py table_schemas
+// This schema represents a simple blog system with users, posts, and comments
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id         Int       @id @default(autoincrement())
+  name       String
+  email      String    @unique
+  created_at DateTime  @default(now())
+  
+  // Relations
+  posts      Post[]
+  comments   Comment[]
+  
+  @@map("users")
+}
+
+model Post {
+  id         Int       @id @default(autoincrement())
+  title      String
+  content    String
+  user_id    Int
+  published  Boolean   @default(false)
+  created_at DateTime  @default(now())
+  
+  // Relations
+  user       User      @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  comments   Comment[]
+  
+  @@map("posts")
+}
+
+model Comment {
+  id         Int       @id @default(autoincrement())
+  post_id    Int
+  user_id    Int
+  content    String
+  created_at DateTime  @default(now())
+  
+  // Relations
+  post       Post      @relation(fields: [post_id], references: [id], onDelete: Cascade)
+  user       User      @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  
+  @@map("comments")
+}

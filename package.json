@@ -1,0 +1,44 @@
+{
+  "name": "db_migrations",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "src/index.ts",
+  "license": "Unlicensed",
+  "private": true,
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.730.0",
+    "@aws-sdk/client-secrets-manager": "^3.629.0",
+    "@aws-sdk/lib-storage": "^3.758.0",
+    "@prisma/client": "^6.12.0",
+    "execa": "^9.3.1",
+    "pg": "^8.12.0"
+  },
+  "scripts": {
+    "compile": "node esbuild.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --project=unit",
+    "test:unit": "vitest run --project=unit",
+    "test:integration": "vitest run --project=integration",
+    "test:all": "vitest run",
+    "build": "yarn run typecheck && yarn run compile",
+    "migrate": "yarn build && node ./dist/db_migration.js",
+    "migrate:dev": "tsx src/db_migration.ts",
+    "migration": "tsx src/db_migration.ts",
+    "validate": "yarn build && node ./dist/validate_migration.js",
+    "validate:dev": "tsx src/validate_migration.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.3.0",
+    "@types/pg": "^8.11.10",
+    "esbuild": "^0.23.0",
+    "esbuild-plugin-tsc": "^0.4.0",
+    "jsdom": "^26.1.0",
+    "prisma": "^5.20.0",
+    "tsx": "^4.20.3",
+    "typescript": "^5.5.4",
+    "vitest": "^3.2.4"
+  },
+  "engines": {
+    "node": ">=22.12.0 < 24.0.0"
+  }
+}

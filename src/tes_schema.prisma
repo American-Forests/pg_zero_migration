@@ -1,0 +1,384 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+datasource db {
+  provider = "postgres"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["fullTextSearch"]
+}
+
+// --------------------------------------
+
+enum AreaType {
+  RIGHT_OF_WAY
+  PARCEL
+}
+
+enum City {
+  RICHMOND
+  BOSTON
+  DC
+  RUSTON
+  NATIONAL
+  RHODE_ISLAND
+  INDIANAPOLIS
+  DETROIT
+  MARICOPA
+  AUSTIN
+  FRANKLIN
+  DALLAS
+  TORONTO
+  WASHINGTON
+  HOUSTON
+}
+
+enum TokenType {
+  RESET_PASSWORD
+}
+
+model User {
+  id             Int      @id @default(autoincrement())
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  name           String?
+  email          String   @unique
+  hashedPassword String?
+  role           String   @default("USER")
+
+  tokens    Token[]
+  scenarios Scenario[]
+  sessions  Session[]
+}
+
+model Session {
+  id                 Int       @id @default(autoincrement())
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+  expiresAt          DateTime?
+  handle             String    @unique
+  hashedSessionToken String?
+  antiCSRFToken      String?
+  publicData         String?
+  privateData        String?
+
+  user   User? @relation(fields: [userId], references: [id])
+  userId Int?
+}
+
+model Token {
+  id          Int       @id @default(autoincrement())
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  hashedToken String
+  type        TokenType
+  expiresAt   DateTime
+  sentTo      String
+
+  user   User @relation(fields: [userId], references: [id])
+  userId Int
+
+  @@unique([hashedToken, type])
+}
+
+model BlockgroupOnScenario {
+  scenario              Scenario   @relation(fields: [scenarioId], references: [id])
+  scenarioId            Int
+  blockgroup            Blockgroup @relation(fields: [blockgroupId], references: [id])
+  blockgroupId          String
+  targetArea            Float      @default(0)
+  treeEquityScoreTarget Int        @default(0)
+  name                  String     @default("block group")
+  land_area_change      Boolean?
+  tes_change            Boolean?
+  target_change         Boolean?
+  target_area_change    Boolean?
+  area_id_change        Boolean?
+  lookup_id_change      Boolean?
+
+  @@id([scenarioId, blockgroupId])
+}
+
+model AreaOnScenario {
+  scenario    Scenario @relation(fields: [scenarioId], references: [id])
+  scenarioId  Int
+  area        Area     @relation(fields: [areaId], references: [id])
+  areaId      String
+  treesSmall  Int      @default(0)
+  treesMedium Int      @default(0)
+  treesLarge  Int      @default(0)
+  name        String?
+
+  @@id([scenarioId, areaId])
+}
+
+model Scenario {
+  id          Int                    @id @default(autoincrement())
+  name        String
+  createdAt   DateTime               @default(now())
+  updatedAt   DateTime               @updatedAt
+  user        User                   @relation(fields: [userId], references: [id])
+  userId      Int
+  areas       AreaOnScenario[]
+  blockgroups BlockgroupOnScenario[]
+  city        City
+
+  @@unique([userId, name, city])
+}
+
+model TreeCanopy {
+  gid  Int                                         @id @default(autoincrement())
+  geom Unsupported("geometry(MultiPolygon, 4326)")
+  city City                                        @default(RICHMOND)
+
+  @@index([geom], name: "tree_canopy_idx", type: Gist)
+}
+
+model Municipality {
+  gid                                       Int                                         @default(autoincrement())
+  geom                                      Unsupported("geometry(MultiPolygon, 4326)")
+  state                                     String
+  incorporated_place_name                   String?
+  incorporated_place_mean_tree_equity_score Float?
+  slug                                      String                                      @id
+  city                                      City                                        @default(NATIONAL)
+
+  @@index([state])
+  @@index([geom], name: "municipality_idx", type: Gist)
+}
+
+model Area {
+  gid                         Int                                         @unique @default(autoincrement())
+  id                          String                                      @id
+  blockgroupId                String // geoid of blockgroup
+  blockgroup                  Blockgroup                                  @relation(fields: [blockgroupId], references: [id])
+  type                        AreaType
+  city                        City                                        @default(RICHMOND)
+  address                     String?
+  area_sqkm                   Float
+  water                       Float
+  tree_canopy                 Float
+  potential_tree_canopy       Float
+  potential_vegetation        Float?
+  potential_paved             Float?
+  unsuitable_surface          Float?
+  impervious_surface          Float
+  school                      Boolean?
+  park                        Boolean?
+  public                      Boolean?
+  flood                       String?
+  rented                      Boolean?
+  industrial                  Boolean?
+  sidewalk                    Boolean?
+  parking                     Boolean?
+  neighborhood                String?
+  open_space                  Boolean?
+  hez                         Boolean?
+  watershed                   String?
+  tree_canopy_gain            Float?
+  tree_canopy_loss            Float?
+  subwatershed                String?
+  worship                     Boolean?
+  current_commercial_land_use Boolean?
+  future_commercial_land_use  Boolean?
+  land_use                    String?
+  cooling_center              String?
+  qualified_census_tract      Boolean?
+  bus_stop                    Boolean?
+  light_rail                  Boolean?
+  mean_radiant_temperature_15 Float?
+  mean_radiant_temperature_19 Float?
+  social_vulnerability_index  Float?
+  neighborhood_type           String?
+  brownfield                  Boolean?
+  canopy_change_percent       Float?
+  future_land_use             String?
+  public_ownership_type       String?
+  library                     Boolean?
+  affordable_housing          Boolean?
+  community_garden            Boolean?
+  ej_screen                   Float?
+  building_shade12            Float?
+  total_shade12               Float?
+  building_shade18            Float?
+  building_shade15            Float?
+  trees_shade12               Float?
+  total_shade15               Float?
+  trees_shade15               Float?
+  trees_shade18               Float?
+  total_shade18               Float?
+  scenarios                   AreaOnScenario[]
+  geom                        Unsupported("geometry(MultiPolygon, 4326)")
+
+  @@index([geom], name: "area_idx", type: Gist)
+}
+
+model Blockgroup {
+  gid                                       Int                                         @unique @default(autoincrement())
+  id                                        String                                      @id
+  geom                                      Unsupported("geometry(MultiPolygon, 4326)")
+  scenarios                                 BlockgroupOnScenario[]
+  af_id                                     String?
+  municipality_slug                         String?
+  state                                     String?
+  fips                                      String?
+  equity_index                              Float
+  tree_canopy_gap_max                       Float
+  tree_canopy                               Float
+  area_sqkm                                 Float?
+  poverty_percent                           Float
+  poverty_percent_normalized                Float
+  incorporated_place_name                   String?
+  incorporated_place_mean_tree_equity_score Float?
+  poc_percent                               Float
+  poc_percent_normalized                    Float
+  unemployment_rate                         Float
+  unemployment_rate_normalized              Float
+  dependent_ratio                           Float
+  dependent_ratio_normalized                Float
+  child_percent                             Float
+  senior_percent                            Float
+  tree_equity_score                         Float
+  congressional_district                    String
+  mental_health                             Float?
+  health_normalized                         Float
+  clipped_bg_population                     Float?
+  total_population                          Float
+  tree_canopy_goal                          Float
+  tree_canopy_gap                           Float
+  temperature                               Float
+  temperature_normalized                    Float
+  linguistic_isolation                      Float
+  linguistic_isolation_normalized           Float
+  ua_name                                   String?
+  county                                    String?
+  county_slug                               String?
+  rank                                      Int?
+  rank_group_size                           Int?
+  holc_grade                                String?
+  ej_disadvantaged                          String?
+  building_shade12                          Float?
+  total_shade12                             Float?
+  building_shade18                          Float?
+  building_shade15                          Float?
+  trees_shade12                             Float?
+  total_shade15                             Float?
+  trees_shade15                             Float?
+  trees_shade18                             Float?
+  total_shade18                             Float?
+
+  supplemental BlockgroupSupplemental?
+
+  Area Area[]
+
+  @@index([geom], name: "blockgroup_idx", type: Gist)
+}
+
+model BlockgroupSupplemental {
+  id                                String     @id
+  blockgroup                        Blockgroup @relation(fields: [id], references: [id])
+  city                              City?
+  potential_tree_canopy             Float?
+  potential_vegetation              Float?
+  potential_paved                   Float?
+  impervious_surface                Float?
+  unsuitable_surface                Float?
+  afternoon_air_average_temperature Float?
+  evening_air_average_temperature   Float?
+  neighborhood                      String?
+  name_ej_criteria                  String?
+  number_ej_criteria                Int?
+  subwatershed                      String?
+  tree_canopy_gain                  Float?
+  tree_canopy_loss                  Float?
+  health_risk                       String?
+  hez                               Boolean?
+  watershed                         String?
+  parks_access                      Float?
+  air_pollution                     String?
+  qualified_census_tract            Boolean?
+  light_rail                        Boolean?
+  mean_radiant_temperature_15       Float?
+  mean_radiant_temperature_19       Float?
+  council_district                  String?
+  asthma_percent                    Float?
+  population_density                Float?
+  canopy_change_percent             Float?
+  neighborhood_id                   String?
+  neighborhood_score                Int?
+  neighborhood_score_category       String?
+  neighborhood_designation          String?
+  ward                              String?
+  tree_planting_investment_index    Float?
+  social_vulnerability_index        Float?
+  road_emissions                    Float?
+  municipality_name                 String?
+  low_food_access                   Boolean?
+  community_garden                  Boolean?
+  affordable_housing                Boolean?
+  ttf_tree_equity_planting          String?
+  ej_screen                         Float?
+  school_district                   String?
+}
+
+model CongressionalDistrict {
+  gid  Int                                  @id @default(autoincrement())
+  geom Unsupported("geometry(Point, 4326)")
+  name String
+
+  @@index([geom], name: "congressional_district_idx", type: Gist)
+}
+
+model State {
+  gid          Int                                  @id @default(autoincrement())
+  geom         Unsupported("geometry(Point, 4326)")
+  abbreviation String
+  name         String?
+
+  @@index([geom], name: "state_idx", type: Gist)
+}
+
+model County {
+  gid   Int                                  @id @default(autoincrement())
+  geom  Unsupported("geometry(Point, 4326)")
+  slug  String
+  name  String
+  state String?
+
+  @@index([geom], name: "county_idx", type: Gist)
+}
+
+model spatial_ref_sys {
+  srid      Int     @id
+  auth_name String? @db.VarChar(256)
+  auth_srid Int?
+  srtext    String? @db.VarChar(2048)
+  proj4text String? @db.VarChar(2048)
+
+  @@ignore
+}
+
+model iTree {
+  fips                          String @id
+  co2_value                     Float?
+  co2                           Float?
+  co_value                      Float?
+  co                            Float?
+  no2_value                     Float?
+  no2                           Float?
+  ozone_value                   Float?
+  ozone                         Float?
+  pm25_value                    Float?
+  pm25                          Float?
+  pm10_value                    Float?
+  pm10                          Float?
+  so2_value                     Float?
+  so2                           Float?
+  rain_int                      Float?
+  runoff_avoided_value          Float?
+  runoff_avoided                Float?
+  total_ecosystem_service_value Float?
+}

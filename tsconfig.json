@@ -1,0 +1,17 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "outDir": "dist",
+    "rootDir": "src",
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": ["src", "defs.d.ts"],
+  "exclude": ["node_modules"]
+}
