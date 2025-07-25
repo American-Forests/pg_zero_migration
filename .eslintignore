@@ -1,0 +1,6 @@
+dist/
+node_modules/
+*.js
+*.mjs
+esbuild.mjs
+vitest.config.ts
