@@ -511,60 +511,71 @@ export class DatabaseMigrator {
       // Disable foreign key constraints for the destination database during setup
       await this.disableForeignKeyConstraints(this.destPool);
 
-      // Prepare source database by moving tables to shadow schema
-      await this.prepareSourceForShadowDump(sourceTables);
+      try {
+        // Prepare source database by moving tables to shadow schema
+        await this.prepareSourceForShadowDump(sourceTables);
 
-      // Create binary dump for maximum efficiency and parallelization
-      const dumpPath = join(this.tempDir, `source_dump_${timestamp}.backup`);
-      await this.createBinaryDump(dumpPath);
+        // Enable write protection on source database for safety during dump/restore process
+        await this.enableWriteProtection();
 
-      // Drop and recreate shadow schema on destination before restore
-      this.log('⚠️  Dropping existing shadow schema on destination (if exists)');
-      await client.query('DROP SCHEMA IF EXISTS shadow CASCADE;');
-      this.log('✅ Shadow schema dropped - will be recreated by pg_restore');
+        // Create binary dump for maximum efficiency and parallelization
+        const dumpPath = join(this.tempDir, `source_dump_${timestamp}.backup`);
+        await this.createBinaryDump(dumpPath);
 
-      // Restore shadow schema data with full parallelization
-      const jobCount = Math.min(8, cpus().length);
-      this.log(`🚀 Restoring with ${jobCount} parallel jobs...`);
+        // Drop and recreate shadow schema on destination before restore
+        this.log('⚠️  Dropping existing shadow schema on destination (if exists)');
+        await client.query('DROP SCHEMA IF EXISTS shadow CASCADE;');
+        this.log('✅ Shadow schema dropped - will be recreated by pg_restore');
 
-      const restoreArgs = [
-        '--jobs',
-        jobCount.toString(),
-        '--format',
-        'custom',
-        '--no-privileges',
-        '--no-owner',
-        '--disable-triggers',
-        '--dbname',
-        this.destConfig.database,
-        '--host',
-        this.destConfig.host,
-        '--port',
-        this.destConfig.port.toString(),
-        '--username',
-        this.destConfig.user,
-        dumpPath,
-      ];
+        // Restore shadow schema data with full parallelization
+        const jobCount = Math.min(8, cpus().length);
+        this.log(`🚀 Restoring with ${jobCount} parallel jobs...`);
 
-      const restoreEnv = {
-        ...process.env,
-        PGPASSWORD: this.destConfig.password,
-      };
+        const restoreArgs = [
+          '--jobs',
+          jobCount.toString(),
+          '--format',
+          'custom',
+          '--no-privileges',
+          '--no-owner',
+          '--disable-triggers',
+          '--dbname',
+          this.destConfig.database,
+          '--host',
+          this.destConfig.host,
+          '--port',
+          this.destConfig.port.toString(),
+          '--username',
+          this.destConfig.user,
+          dumpPath,
+        ];
 
-      await execa('pg_restore', restoreArgs, { env: restoreEnv });
-      this.log('✅ Source data restored to shadow schema with parallelization');
+        const restoreEnv = {
+          ...process.env,
+          PGPASSWORD: this.destConfig.password,
+        };
 
-      // Restore source database tables back to public schema
-      await this.restoreSourceFromShadowDump(sourceTables);
+        await execa('pg_restore', restoreArgs, { env: restoreEnv });
+        this.log('✅ Source data restored to shadow schema with parallelization');
 
-      // Clean up dump file
-      if (existsSync(dumpPath)) {
-        unlinkSync(dumpPath);
+        // Disable write protection before restoring source database structure
+        await this.disableWriteProtection();
+
+        // Restore source database tables back to public schema
+        await this.restoreSourceFromShadowDump(sourceTables);
+
+        // Clean up dump file
+        if (existsSync(dumpPath)) {
+          unlinkSync(dumpPath);
+        }
+
+        // Update statistics
+        this.stats.tablesProcessed = sourceTables.length;
+        await this.updateRecordsMigratedCount(sourceTables);
+      } finally {
+        // Always remove write protection from source database, even if migration fails
+        await this.disableWriteProtection();
       }
-
-      // Update statistics
-      this.stats.tablesProcessed = sourceTables.length;
-      await this.updateRecordsMigratedCount(sourceTables);
     } finally {
       client.release();
     }
@@ -1424,6 +1435,100 @@ export class DatabaseMigrator {
       this.log(`✅ Total records migrated: ${totalRecords}`);
     } catch (error) {
       this.logError('Failed to count migrated records', error);
+    }
+  }
+
+  /**
+   * Enable write protection on source database tables to prevent data modification during migration
+   * Uses triggers that block INSERT/UPDATE/DELETE operations while allowing schema operations
+   */
+  private async enableWriteProtection(): Promise<void> {
+    this.log('🔒 Enabling write protection on source database tables...');
+
+    const client = await this.sourcePool.connect();
+    try {
+      // Create a function that blocks writes
+      await client.query(`
+        CREATE OR REPLACE FUNCTION migration_block_writes()
+        RETURNS TRIGGER AS $$
+        BEGIN
+          RAISE EXCEPTION 'Data modification blocked during migration process'
+            USING ERRCODE = 'P0001',
+                  HINT = 'Migration in progress - please wait';
+          RETURN NULL;
+        END;
+        $$ LANGUAGE plpgsql;
+      `);
+
+      // Get all user tables (excluding system tables)
+      const result = await client.query(`
+        SELECT tablename 
+        FROM pg_tables 
+        WHERE schemaname = 'public'
+      `);
+
+      // Create triggers on all tables to block writes
+      for (const row of result.rows) {
+        const tableName = row.tablename;
+        const triggerName = `migration_write_block_${tableName}`;
+
+        await client.query(`
+          CREATE TRIGGER ${triggerName}
+          BEFORE INSERT OR UPDATE OR DELETE ON "${tableName}"
+          FOR EACH ROW
+          EXECUTE FUNCTION migration_block_writes();
+        `);
+
+        this.log(`🔒 Write protection enabled for table: ${tableName}`);
+      }
+
+      this.log('✅ Write protection enabled on all source tables');
+    } catch (error) {
+      this.logError('Failed to enable write protection', error);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Disable write protection on source database tables to restore normal operations
+   */
+  private async disableWriteProtection(): Promise<void> {
+    this.log('🔓 Removing write protection from source database tables...');
+
+    const client = await this.sourcePool.connect();
+    try {
+      // Get all user tables
+      const result = await client.query(`
+        SELECT tablename 
+        FROM pg_tables 
+        WHERE schemaname = 'public'
+      `);
+
+      // Drop triggers from all tables
+      for (const row of result.rows) {
+        const tableName = row.tablename;
+        const triggerName = `migration_write_block_${tableName}`;
+
+        try {
+          await client.query(`DROP TRIGGER IF EXISTS ${triggerName} ON "${tableName}";`);
+          this.log(`🔓 Write protection removed from table: ${tableName}`);
+        } catch (error) {
+          // Log but don't fail if trigger doesn't exist
+          this.log(`⚠️  Could not remove trigger from ${tableName}: ${error}`);
+        }
+      }
+
+      // Clean up the blocking function
+      await client.query('DROP FUNCTION IF EXISTS migration_block_writes();');
+
+      this.log('✅ Write protection removed from all source tables');
+    } catch (error) {
+      this.logError('Failed to disable write protection', error);
+      // Don't throw here - we want to continue even if cleanup fails
+    } finally {
+      client.release();
     }
   }
 }
