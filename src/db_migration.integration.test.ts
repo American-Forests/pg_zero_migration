@@ -503,9 +503,35 @@ describe('TES Schema Migration Integration Tests', () => {
     `);
     expect(destExtensions.length).toBeGreaterThanOrEqual(1);
 
+    // Verify sequences are properly reset after migration
+    console.log('Verifying sequence reset functionality...');
+
+    // Test inserting new records to verify sequences work correctly
+    const newUserResult = await destLoader.executeQuery(`
+      INSERT INTO "User" (name, email, "updatedAt")
+      VALUES ('Test User', 'test@example.com', NOW())
+      RETURNING id;
+    `);
+    const newUserId = newUserResult[0].id;
+    expect(newUserId).toBeGreaterThan(4); // Should be at least 5 (next after existing 4 records)
+
+    // Verify the User sequence was properly reset
+    const userSeqResult = await destLoader.executeQuery(`
+      SELECT last_value FROM "User_id_seq";
+    `);
+    expect(parseInt(userSeqResult[0].last_value)).toBeGreaterThanOrEqual(newUserId);
+
+    // Test sequence for tables with gid columns that have working sequences
+    // Just verify the sequence value rather than inserting new records
+    const treeCanopySeqResult = await destLoader.executeQuery(`
+      SELECT last_value FROM "TreeCanopy_gid_seq";
+    `);
+    expect(parseInt(treeCanopySeqResult[0].last_value)).toBe(5); // Should be properly reset to 5
+
     console.log('✅ TES source database schema restoration verified');
     console.log('✅ TES backup schema creation verified');
     console.log('✅ PostGIS geometry data migration verified');
+    console.log('✅ Sequence reset functionality verified');
     console.log('✅ Complete TES migration and data verification successful');
   }, 120000); // Extended timeout for complex TES migration
 });

@@ -564,6 +564,7 @@ export class DatabaseMigrator {
 
       // Update statistics
       this.stats.tablesProcessed = sourceTables.length;
+      await this.updateRecordsMigratedCount(sourceTables);
     } finally {
       client.release();
     }
@@ -1232,14 +1233,70 @@ export class DatabaseMigrator {
       for (const sequence of table.sequences) {
         try {
           const tableName = table.tableName.replace('_shadow', '');
+
+          // First check if the table exists
+          const tableExistsResult = await this.destPool.query(
+            `SELECT EXISTS (
+              SELECT 1 FROM information_schema.tables 
+              WHERE table_schema = 'public' 
+              AND table_name = $1
+            )`,
+            [tableName]
+          );
+
+          if (!tableExistsResult.rows[0].exists) {
+            this.log(
+              `⚠️  Table "${tableName}" does not exist, skipping sequence reset for ${sequence.sequenceName}`
+            );
+            continue;
+          }
+
+          // Check if the column exists
+          const columnExistsResult = await this.destPool.query(
+            `SELECT EXISTS (
+              SELECT 1 FROM information_schema.columns 
+              WHERE table_schema = 'public' 
+              AND table_name = $1 
+              AND column_name = $2
+            )`,
+            [tableName, sequence.columnName]
+          );
+
+          if (!columnExistsResult.rows[0].exists) {
+            this.log(
+              `⚠️  Column "${sequence.columnName}" does not exist in table "${tableName}", skipping sequence reset for ${sequence.sequenceName}`
+            );
+            continue;
+          }
+
+          // Check if the sequence exists
+          const sequenceExistsResult = await this.destPool.query(
+            `SELECT EXISTS (
+              SELECT 1 FROM information_schema.sequences 
+              WHERE sequence_schema = 'public' 
+              AND sequence_name = $1
+            )`,
+            [sequence.sequenceName.replace(/^"?public"?\./, '').replace(/"/g, '')]
+          );
+
+          if (!sequenceExistsResult.rows[0].exists) {
+            this.log(
+              `⚠️  Sequence "${sequence.sequenceName}" does not exist, skipping sequence reset`
+            );
+            continue;
+          }
+
+          // Properly quote table and column names to handle case sensitivity
           const maxResult = await this.destPool.query(
-            `SELECT COALESCE(MAX(${sequence.columnName}), 0) as max_val FROM ${tableName}`
+            `SELECT COALESCE(MAX("${sequence.columnName}"), 0) as max_val FROM "${tableName}"`
           );
           const maxValue = parseInt(maxResult.rows[0].max_val);
           const nextValue = maxValue + 1;
 
           await this.destPool.query(`SELECT setval('${sequence.sequenceName}', $1)`, [nextValue]);
-          this.log(`✅ Reset sequence ${sequence.sequenceName} to ${nextValue}`);
+          this.log(
+            `✅ Reset sequence ${sequence.sequenceName} to ${nextValue} (max value in ${tableName}.${sequence.columnName}: ${maxValue})`
+          );
         } catch (error) {
           this.logError(`Failed to reset sequence ${sequence.sequenceName}`, error);
         }
@@ -1336,6 +1393,37 @@ export class DatabaseMigrator {
     if (this.stats.errors.length > 0) {
       this.log('❌ Errors:');
       this.stats.errors.forEach(error => this.log(`   - ${error}`));
+    }
+  }
+
+  /**
+   * Update the records migrated count by querying the migrated tables
+   */
+  private async updateRecordsMigratedCount(sourceTables: TableInfo[]): Promise<void> {
+    this.log('📊 Counting migrated records...');
+
+    try {
+      let totalRecords = 0;
+
+      for (const table of sourceTables) {
+        try {
+          // Count records in the destination table (after migration)
+          const result = await this.destPool.query(
+            `SELECT COUNT(*) as count FROM "${table.tableName}"`
+          );
+          const tableCount = parseInt(result.rows[0].count);
+          totalRecords += tableCount;
+
+          this.log(`📋 ${table.tableName}: ${tableCount} records migrated`);
+        } catch (error) {
+          this.logError(`Could not count records in ${table.tableName}`, error);
+        }
+      }
+
+      this.stats.recordsMigrated = totalRecords;
+      this.log(`✅ Total records migrated: ${totalRecords}`);
+    } catch (error) {
+      this.logError('Failed to count migrated records', error);
     }
   }
 }
