@@ -148,17 +148,61 @@ export class DbTestFixtureLoader {
    */
   private async updateSequenceForColumn(tableName: string, columnName: string): Promise<void> {
     try {
-      // Get the maximum value in the column
+      // Get the maximum value in the column first
       const maxQuery = `SELECT COALESCE(MAX("${columnName}"), 0) as max_val FROM "${tableName}"`;
       const maxResult = await this.client.query(maxQuery);
       const maxValue = parseInt(maxResult.rows[0].max_val);
 
-      // Update the sequence to max + 1
-      const sequenceName = `${tableName}_${columnName}_seq`;
-      const updateSequenceQuery = `SELECT setval('"${sequenceName}"', $1)`;
-      await this.client.query(updateSequenceQuery, [maxValue + 1]);
+      // Try to find the sequence using multiple naming conventions
+      const possibleSequenceNames = [
+        `"${tableName}_${columnName}_seq"`, // Standard Prisma naming (quoted)
+        `${tableName}_${columnName}_seq`, // Standard Prisma naming (unquoted)
+        `"${tableName.toLowerCase()}_${columnName.toLowerCase()}_seq"`, // Lowercase (quoted)
+        `${tableName.toLowerCase()}_${columnName.toLowerCase()}_seq`, // Lowercase (unquoted)
+      ];
 
-      console.log(`🔄 Updated sequence ${sequenceName} to ${maxValue + 1}`);
+      let sequenceFound = false;
+
+      for (const sequenceName of possibleSequenceNames) {
+        try {
+          // Check if this sequence exists
+          const checkQuery = `SELECT 1 FROM information_schema.sequences WHERE sequence_name = $1`;
+          const cleanSequenceName = sequenceName.replace(/"/g, '');
+          const checkResult = await this.client.query(checkQuery, [cleanSequenceName]);
+
+          if (checkResult.rows.length > 0) {
+            // Update the sequence to max + 1
+            const updateSequenceQuery = `SELECT setval('${sequenceName}', $1)`;
+            await this.client.query(updateSequenceQuery, [maxValue + 1]);
+            console.log(`🔄 Updated sequence ${sequenceName} to ${maxValue + 1}`);
+            sequenceFound = true;
+            break;
+          }
+        } catch {
+          // Continue to next possible name
+          continue;
+        }
+      }
+
+      if (!sequenceFound) {
+        // Also try using pg_get_serial_sequence as a fallback
+        const serialSequenceQuery = `SELECT pg_get_serial_sequence('"${tableName}"', '${columnName}') as sequence_name`;
+        const serialResult = await this.client.query(serialSequenceQuery);
+        const serialSequenceName = serialResult.rows[0]?.sequence_name;
+
+        if (serialSequenceName) {
+          const updateSequenceQuery = `SELECT setval('${serialSequenceName}', $1)`;
+          await this.client.query(updateSequenceQuery, [maxValue + 1]);
+          console.log(`🔄 Updated sequence ${serialSequenceName} to ${maxValue + 1}`);
+          sequenceFound = true;
+        }
+      }
+
+      if (!sequenceFound) {
+        console.warn(
+          `⚠️ No sequence found for ${tableName}.${columnName} despite @default(autoincrement())`
+        );
+      }
     } catch (error) {
       // Sequence might not exist, which is okay for some setups
       console.warn(

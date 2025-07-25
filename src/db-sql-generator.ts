@@ -46,7 +46,7 @@ export class DbSqlGenerator {
 
     // Generate column definitions
     for (const column of table.columns) {
-      const columnSql = this.generateColumnDefinition(column);
+      const columnSql = this.generateColumnDefinition(column, table.name);
       columnDefinitions.push(columnSql);
     }
 
@@ -83,10 +83,20 @@ export class DbSqlGenerator {
   /**
    * Generate column definition SQL
    */
-  private static generateColumnDefinition(column: ColumnDefinition): string {
-    const columnType = column.type;
+  private static generateColumnDefinition(column: ColumnDefinition, _tableName: string): string {
+    let sql = `"${column.name}"`;
 
-    let sql = `"${column.name}" ${columnType}`;
+    // Handle autoIncrement columns - ALL should be SERIAL in PostgreSQL (Prisma mapping)
+    if (column.autoIncrement && column.type === 'INTEGER') {
+      sql += ' SERIAL';
+      if (!column.nullable) {
+        sql += ' NOT NULL';
+      }
+      return sql;
+    }
+
+    // Handle non-autoIncrement columns
+    sql += ` ${column.type}`;
 
     // Add NOT NULL constraint
     if (!column.nullable) {
@@ -101,14 +111,6 @@ export class DbSqlGenerator {
         sql += ` DEFAULT '${column.defaultValue}'`;
       } else {
         sql += ` DEFAULT ${column.defaultValue}`;
-      }
-    }
-
-    // Add SERIAL for auto-increment integer primary keys
-    if (column.autoIncrement && column.primaryKey && column.type === 'INTEGER') {
-      sql = `"${column.name}" SERIAL`;
-      if (!column.nullable) {
-        sql += ' NOT NULL';
       }
     }
 
@@ -184,7 +186,7 @@ export class DbSqlGenerator {
   static generateCompleteSchema(schema: DatabaseSchema): string[] {
     const statements: string[] = [];
 
-    // Create tables first
+    // Create tables (SERIAL columns automatically create sequences)
     statements.push(...this.generateCreateTableStatements(schema));
 
     // Create indexes after tables
