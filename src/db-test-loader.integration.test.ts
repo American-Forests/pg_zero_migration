@@ -55,7 +55,7 @@ describe('DbTestLoader Integration Tests', () => {
       // Cleanup: disconnect and drop test database using built-in method
       await loader.disconnect();
       await loader.cleanupTestDatabase();
-    } catch (error) {
+    } catch {
       // Silently handle cleanup errors - they may happen if tests fail
       // The cleanup will be attempted again by the next test
     }
@@ -244,7 +244,7 @@ describe('DbTestLoader Integration Tests', () => {
         if (tesLoader) {
           await tesLoader.cleanupTestDatabase();
         }
-      } catch (error) {
+      } catch {
         // TES cleanup warning - test cleanup failed
       }
     });
@@ -293,8 +293,21 @@ describe('DbTestLoader Integration Tests', () => {
       // Should find geometry columns in TES tables (debug info available in allTables/allColumns)
       expect(allTables.length).toBeGreaterThan(0);
 
-      // Check if the specific tables we expect exist
+      // Verify that columns were found
+      expect(allColumns.length).toBeGreaterThan(0);
+
+      // Check that each expected table has at least some columns
       const expectedTables = ['TreeCanopy', 'Municipality', 'Area', 'Blockgroup'];
+      for (const tableName of expectedTables) {
+        const tableColumns = allColumns.filter((col: any) => col.table_name === tableName);
+        expect(tableColumns.length).toBeGreaterThan(0);
+      }
+
+      // Verify we have geometry columns (USER-DEFINED type indicates PostGIS geometry)
+      const geometryColumns = allColumns.filter((col: any) => col.data_type === 'USER-DEFINED');
+      expect(geometryColumns.length).toBeGreaterThan(0);
+
+      // Check if the specific tables we expect exist
       const actualTableNames = allTables.map((r: any) => r.table_name);
       for (const tableName of expectedTables) {
         expect(actualTableNames).toContain(tableName);

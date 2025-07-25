@@ -84,14 +84,7 @@ export class DbSqlGenerator {
    * Generate column definition SQL
    */
   private static generateColumnDefinition(column: ColumnDefinition): string {
-    let columnType = column.type;
-
-    // Handle PostGIS geometry types
-    if (columnType.startsWith('geometry(')) {
-      // For PostGIS, we can use the geometry type directly
-      // PostgreSQL with PostGIS should recognize this syntax
-      columnType = columnType;
-    }
+    const columnType = column.type;
 
     let sql = `"${column.name}" ${columnType}`;
 

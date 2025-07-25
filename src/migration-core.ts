@@ -794,40 +794,9 @@ export class DatabaseMigrator {
   }
 
   /**
-   * Legacy method - preserved tables are now handled via real-time sync
-   * This method is kept for backwards compatibility and as a final validation
-   */
-  private async restorePreservedTableDataFromBackup(
-    destTables: TableInfo[],
-    timestamp: number
-  ): Promise<void> {
-    if (this.preservedTables.size === 0) {
-      this.log('✅ No preserved tables - real-time sync handled all data');
-      return;
-    }
-
-    this.log('✅ Preserved tables handled via real-time sync - no restoration needed');
-    this.log('💡 Backup tables are available for rollback if needed');
-
-    // Optional: Validate that preserved tables have data
-    const client = await this.destPool.connect();
-    try {
-      for (const tableName of this.preservedTables) {
-        const countResult = await client.query(`SELECT COUNT(*) FROM ${tableName}`);
-        const rowCount = parseInt(countResult.rows[0].count);
-        this.log(`✅ Preserved table ${tableName}: ${rowCount} rows (sync validated)`);
-      }
-    } catch (error) {
-      this.logError('Warning: Could not validate preserved table counts', error);
-    } finally {
-      client.release();
-    }
-  }
-
-  /**
    * Phase 2A: Setup preserved table synchronization
    */
-  private async setupPreservedTableSync(destTables: TableInfo[], timestamp: number): Promise<void> {
+  private async setupPreservedTableSync(): Promise<void> {
     if (this.preservedTables.size === 0) {
       this.log('✅ No preserved tables to sync');
       return;
@@ -970,7 +939,7 @@ export class DatabaseMigrator {
   /**
    * Phase 4: Cleanup sync triggers and validate consistency
    */
-  private async cleanupSyncTriggersAndValidate(timestamp: number): Promise<void> {
+  private async cleanupSyncTriggersAndValidate(): Promise<void> {
     if (this.activeSyncTriggers.length === 0) {
       this.log('✅ No sync triggers to cleanup');
       return;

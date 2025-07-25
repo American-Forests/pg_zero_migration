@@ -26,9 +26,6 @@
  */
 
 import { URL } from 'url';
-import { existsSync } from 'fs';
-import { execa } from 'execa';
-import type { Client } from 'pg';
 import { DbTestLoader } from './db-test-loader.js';
 
 /**
@@ -180,100 +177,6 @@ export class DbTestLoaderMulti {
       console.error(`✗ Failed to initialize database loaders: ${error}`);
       return false;
     }
-  }
-
-  /**
-   * Check if required dependencies are available
-   */
-  async checkDependencies(): Promise<boolean> {
-    console.log('Checking dependencies...');
-
-    // Check pg client (should be available if this code is running)
-    try {
-      const pgModule = await import('pg');
-      console.log('✓ pg client available');
-    } catch (error) {
-      console.error('✗ pg client not found: Install with: npm install pg');
-      return false;
-    }
-
-    // Check @prisma/client
-    try {
-      const prismaModule = await import('@prisma/client');
-      console.log('✓ @prisma/client available');
-    } catch (error) {
-      console.error('✗ @prisma/client not found: Install with: npm install @prisma/client');
-      return false;
-    }
-
-    // Check vitest
-    try {
-      const vitestModule = await import('vitest');
-      console.log('✓ vitest available');
-    } catch (error) {
-      console.error('✗ vitest not found: Install with: npm install vitest');
-      return false;
-    }
-
-    // Check PostgreSQL connections for both hosts
-    console.log('Testing database connections...');
-
-    // Test source database connection
-    try {
-      const { Client } = await import('pg');
-      const sourceClient = new Client(this.sourceAdminUrl);
-      await sourceClient.connect();
-      const result = await sourceClient.query('SELECT version()');
-      const version = result.rows[0].version;
-      console.log(`✓ Source PostgreSQL connection: ${version.substring(0, 50)}...`);
-      await sourceClient.end();
-    } catch (error) {
-      console.error(`✗ Source PostgreSQL connection failed: ${error}`);
-      return false;
-    }
-
-    // Test destination database connection (may be different host)
-    if (this.destAdminUrl !== this.sourceAdminUrl) {
-      try {
-        const { Client } = await import('pg');
-        const destClient = new Client(this.destAdminUrl);
-        await destClient.connect();
-        const result = await destClient.query('SELECT version()');
-        const version = result.rows[0].version;
-        console.log(`✓ Destination PostgreSQL connection: ${version.substring(0, 50)}...`);
-        await destClient.end();
-      } catch (error) {
-        console.error(`✗ Destination PostgreSQL connection failed: ${error}`);
-        return false;
-      }
-    } else {
-      console.log('✓ Source and destination on same host');
-    }
-
-    // Check Node.js and Prisma CLI
-    try {
-      const nodeResult = await execa('node', ['--version']);
-      console.log(`✓ Node.js ${nodeResult.stdout}`);
-    } catch (error) {
-      console.error('✗ Node.js not found');
-      return false;
-    }
-
-    try {
-      const prismaResult = await execa('npx', ['prisma', '--version']);
-      // Extract version from output
-      const versionLines = prismaResult.stdout
-        .split('\n')
-        .filter(line => line.toLowerCase().includes('prisma'));
-      const version = versionLines[0] || 'unknown';
-      console.log(`✓ Prisma CLI ${version}`);
-    } catch (error) {
-      console.error('✗ Prisma CLI not found: Install with: npm install -g prisma');
-      return false;
-    }
-
-    console.log('✓ All dependencies available');
-    return true;
   }
 
   /**

@@ -104,7 +104,7 @@ jobs:
 
       - name: Run security audit
         run: yarn audit --level moderate
-        continue-on-error: true  # Don't fail CI for audit issues, but report them
+        continue-on-error: true # Don't fail CI for audit issues, but report them
 
   all-checks:
     name: All Checks Passed

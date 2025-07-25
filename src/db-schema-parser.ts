@@ -4,7 +4,6 @@
  */
 
 import fs from 'fs';
-import path from 'path';
 import {
   DatabaseSchema,
   TableSchema,
@@ -236,10 +235,6 @@ export class DbSchemaParser {
       !PRISMA_TO_POSTGRES[relationMatch[1]] &&
       !enumTypes.has(relationMatch[1])
     ) {
-      // This is a relation field (not an enum), might create a foreign key
-      const referencedModel = relationMatch[1];
-      const isOptional = !!relationMatch[2];
-
       // Look for @relation attribute to determine foreign key details
       const relationAttr = fieldDefinition.match(/@relation\s*\([^)]+\)/);
       if (relationAttr) {

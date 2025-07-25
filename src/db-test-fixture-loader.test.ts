@@ -131,8 +131,6 @@ describe('DbTestFixtureLoader', () => {
     },
   };
 
-  const testFixturePath = '/path/to/test/fixture.json';
-
   const mockClient = {
     connect: vi.fn(),
     end: vi.fn(),
@@ -193,7 +191,6 @@ describe('DbTestFixtureLoader', () => {
     });
 
     it('should work with optional logger', () => {
-      const mockLogger = vi.fn();
       const loader = new DbTestFixtureLoader(mockClient, mockDatabaseSchema);
       expect(loader).toBeInstanceOf(DbTestFixtureLoader);
     });
@@ -360,7 +357,7 @@ describe('DbTestFixtureLoader', () => {
         getTableNames(): string[] {
           return [];
         },
-        getTable(name: string): TableSchema | undefined {
+        getTable(): TableSchema | undefined {
           return undefined;
         },
         getTablesInDependencyOrder(): string[] {

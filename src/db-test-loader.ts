@@ -26,8 +26,6 @@
  *   - Valid Prisma schema file
  */
 
-import { existsSync } from 'fs';
-import { parseArgs } from 'node:util';
 import { Client, ClientConfig } from 'pg';
 import { DbSchemaParser } from './db-schema-parser.js';
 import { DbSqlGenerator } from './db-sql-generator.js';

@@ -52,7 +52,7 @@ describe('DbTestLoaderMulti Integration Tests', () => {
     try {
       // Cleanup: drop test databases
       await multiLoader.cleanupTestDatabases();
-    } catch (error) {
+    } catch {
       // Silently handle cleanup errors - they may happen if tests fail
       // The cleanup will be attempted again by the next test
     }

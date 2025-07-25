@@ -1,7 +1,5 @@
 #!/usr/bin/env node
 
-/* eslint-disable turbo/no-undeclared-env-vars */
-
 import { Client } from 'pg';
 import { parseArgs } from 'node:util';
 import { DatabaseMigrator, parseDatabaseUrl, DatabaseConfig } from './migration-core.js';
@@ -12,6 +10,19 @@ interface BackupInfo {
   created: Date;
   tableCount: number;
   size: string;
+}
+
+interface ParsedArgs {
+  latest?: boolean;
+  timestamp?: string;
+  before?: string;
+  source?: string;
+  dest?: string;
+  'preserved-tables'?: string;
+  'keep-tables'?: string;
+  json?: boolean;
+  'dry-run'?: boolean;
+  help?: boolean;
 }
 
 class MigrationManager {
@@ -164,8 +175,6 @@ class MigrationManager {
   }
 
   private async performRollback(backup: BackupInfo, keepTables: string[]): Promise<void> {
-    const rollbackTimestamp = Date.now();
-
     this.log('\n⚠️  DESTRUCTIVE ROLLBACK - NO UNDO AVAILABLE');
     this.log(`• Current 'public' schema → renamed to 'shadow' (temporary)`);
     this.log(`• Backup '${backup.schemaName}' → renamed to 'public' (restored)`);
@@ -531,7 +540,7 @@ async function main(): Promise<void> {
   }
 }
 
-async function handleStartCommand(values: any, dryRun: boolean): Promise<void> {
+async function handleStartCommand(values: ParsedArgs, dryRun: boolean): Promise<void> {
   const sourceUrl = values.source || process.env.SOURCE_DATABASE_URL;
   const destUrl = values.dest || process.env.DEST_DATABASE_URL || process.env.DATABASE_URL;
   const preservedTablesEnv = values['preserved-tables'] || process.env.PRESERVED_TABLES || '';
@@ -573,7 +582,11 @@ async function handleStartCommand(values: any, dryRun: boolean): Promise<void> {
   }
 }
 
-async function handleBackupCommand(command: string, values: any, dryRun: boolean): Promise<void> {
+async function handleBackupCommand(
+  command: string,
+  values: ParsedArgs,
+  dryRun: boolean
+): Promise<void> {
   // Database configuration for single-database backup operations
   const config: DatabaseConfig = {
     host: process.env.DB_HOST || 'localhost',
@@ -590,7 +603,7 @@ async function handleBackupCommand(command: string, values: any, dryRun: boolean
       await manager.listBackups(values.json || false);
       break;
 
-    case 'rollback':
+    case 'rollback': {
       let target: number | 'latest';
       if (values.latest) {
         target = 'latest';
@@ -609,6 +622,7 @@ async function handleBackupCommand(command: string, values: any, dryRun: boolean
 
       await manager.rollback(target, keepTables);
       break;
+    }
 
     case 'cleanup':
       if (!values.before) {
@@ -617,7 +631,7 @@ async function handleBackupCommand(command: string, values: any, dryRun: boolean
       await manager.cleanup(values.before);
       break;
 
-    case 'verify':
+    case 'verify': {
       if (!values.timestamp) {
         throw new Error('Verify requires --timestamp option');
       }
@@ -627,6 +641,7 @@ async function handleBackupCommand(command: string, values: any, dryRun: boolean
       }
       await manager.verify(verifyTimestamp);
       break;
+    }
 
     default:
       throw new Error(`Unknown backup command: ${command}`);
