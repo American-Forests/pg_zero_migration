@@ -72,24 +72,24 @@ describe('DbTestLoader Integration Tests', () => {
       // Load test data
       const loadResult = await loader.loadTestData();
       expect(loadResult.success).toBe(true);
-      expect(loadResult.recordCounts.users).toBe(2);
-      expect(loadResult.recordCounts.posts).toBe(2);
-      expect(loadResult.recordCounts.comments).toBe(2);
+      expect(loadResult.recordCounts.User).toBe(2);
+      expect(loadResult.recordCounts.Post).toBe(2);
+      expect(loadResult.recordCounts.Comment).toBe(2);
 
       // Verify data counts
       const dataCounts = await loader.getDataCounts();
-      expect(dataCounts.users).toBe(2);
-      expect(dataCounts.posts).toBe(2);
-      expect(dataCounts.comments).toBe(2);
+      expect(dataCounts.User).toBe(2);
+      expect(dataCounts.Post).toBe(2);
+      expect(dataCounts.Comment).toBe(2);
 
       // Clear test data
       await loader.clearTestData();
 
       // Verify data is cleared
       const countsAfterClear = await loader.getDataCounts();
-      expect(countsAfterClear.users).toBe(0);
-      expect(countsAfterClear.posts).toBe(0);
-      expect(countsAfterClear.comments).toBe(0);
+      expect(countsAfterClear.User).toBe(0);
+      expect(countsAfterClear.Post).toBe(0);
+      expect(countsAfterClear.Comment).toBe(0);
 
       await loader.disconnect();
     }, 30000); // 30 second timeout for database operations
@@ -103,12 +103,12 @@ describe('DbTestLoader Integration Tests', () => {
 
       // Verify tables exist by checking data counts (should be 0)
       const dataCounts = await loader.getDataCounts();
-      expect(dataCounts).toHaveProperty('users');
-      expect(dataCounts).toHaveProperty('posts');
-      expect(dataCounts).toHaveProperty('comments');
-      expect(dataCounts.users).toBe(0);
-      expect(dataCounts.posts).toBe(0);
-      expect(dataCounts.comments).toBe(0);
+      expect(dataCounts).toHaveProperty('User');
+      expect(dataCounts).toHaveProperty('Post');
+      expect(dataCounts).toHaveProperty('Comment');
+      expect(dataCounts.User).toBe(0);
+      expect(dataCounts.Post).toBe(0);
+      expect(dataCounts.Comment).toBe(0);
 
       await loader.disconnect();
     }, 20000);
@@ -127,7 +127,7 @@ describe('DbTestLoader Integration Tests', () => {
 
       // Verify schema setup worked by checking table counts
       const dataCounts = await testLoader.getDataCounts();
-      expect(dataCounts).toHaveProperty('users');
+      expect(dataCounts).toHaveProperty('User');
 
       await testLoader.disconnect();
 
@@ -183,23 +183,23 @@ describe('DbTestLoader Integration Tests', () => {
       // First load cycle
       let loadResult = await loader.loadTestData();
       expect(loadResult.success).toBe(true);
-      expect(loadResult.recordCounts.users).toBe(2);
+      expect(loadResult.recordCounts.User).toBe(2);
 
       let dataCounts = await loader.getDataCounts();
-      expect(dataCounts.users).toBe(2);
+      expect(dataCounts.User).toBe(2);
 
       // Clear data
       await loader.clearTestData();
       dataCounts = await loader.getDataCounts();
-      expect(dataCounts.users).toBe(0);
+      expect(dataCounts.User).toBe(0);
 
       // Second load cycle
       loadResult = await loader.loadTestData();
       expect(loadResult.success).toBe(true);
-      expect(loadResult.recordCounts.users).toBe(2);
+      expect(loadResult.recordCounts.User).toBe(2);
 
       dataCounts = await loader.getDataCounts();
-      expect(dataCounts.users).toBe(2);
+      expect(dataCounts.User).toBe(2);
 
       await loader.disconnect();
     }, 25000);
@@ -212,15 +212,15 @@ describe('DbTestLoader Integration Tests', () => {
       expect(loadResult.success).toBe(true);
 
       // Verify all expected tables have data
-      expect(loadResult.recordCounts.users).toBe(2);
-      expect(loadResult.recordCounts.posts).toBe(2);
-      expect(loadResult.recordCounts.comments).toBe(2);
+      expect(loadResult.recordCounts.User).toBe(2);
+      expect(loadResult.recordCounts.Post).toBe(2);
+      expect(loadResult.recordCounts.Comment).toBe(2);
 
       // Verify referential integrity by checking that all foreign keys are satisfied
       const dataCounts = await loader.getDataCounts();
-      expect(dataCounts.users).toBeGreaterThan(0);
-      expect(dataCounts.posts).toBeGreaterThan(0);
-      expect(dataCounts.comments).toBeGreaterThan(0);
+      expect(dataCounts.User).toBeGreaterThan(0);
+      expect(dataCounts.Post).toBeGreaterThan(0);
+      expect(dataCounts.Comment).toBeGreaterThan(0);
 
       await loader.disconnect();
     }, 20000);

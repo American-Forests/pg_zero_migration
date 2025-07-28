@@ -95,13 +95,13 @@ describe('DbTestLoaderMulti Integration Tests', () => {
       const destCounts = await destLoader.getDataCounts();
 
       // Both databases should have the same record counts from simple_fixture.json
-      expect(sourceCounts.users).toBe(2);
-      expect(sourceCounts.posts).toBe(2);
-      expect(sourceCounts.comments).toBe(2);
+      expect(sourceCounts.User).toBe(2);
+      expect(sourceCounts.Post).toBe(2);
+      expect(sourceCounts.Comment).toBe(2);
 
-      expect(destCounts.users).toBe(2);
-      expect(destCounts.posts).toBe(2);
-      expect(destCounts.comments).toBe(2);
+      expect(destCounts.User).toBe(2);
+      expect(destCounts.Post).toBe(2);
+      expect(destCounts.Comment).toBe(2);
 
       // Verify connection info remains consistent
       const finalConnectionInfo = multiLoader.getConnectionInfo();

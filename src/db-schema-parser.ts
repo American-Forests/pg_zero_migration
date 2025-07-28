@@ -36,6 +36,7 @@ export class DbSchemaParser {
 
     const content = fs.readFileSync(schemaPath, 'utf8');
     const tables: TableSchema[] = [];
+    const modelToTableMap = new Map<string, string>(); // Model name -> Table name mapping
 
     // Parse enums first to build a set of known enum types
     const enumTypes = this.parseEnums(content);
@@ -43,6 +44,7 @@ export class DbSchemaParser {
     // Parse models
     const modelMatches = content.matchAll(/model\s+(\w+)\s*{([^}]+)}/g);
 
+    // First pass: Parse models and build model-to-table mapping
     for (const match of modelMatches) {
       const modelName = match[1];
       const modelBody = match[2];
@@ -50,6 +52,7 @@ export class DbSchemaParser {
       try {
         const table = this.parseModel(modelName, modelBody, enumTypes);
         tables.push(table);
+        modelToTableMap.set(modelName, table.name); // Store mapping
       } catch (error) {
         throw new DbSchemaParseError(`Failed to parse model ${modelName}`, error as Error);
       }
@@ -59,6 +62,26 @@ export class DbSchemaParser {
     const tablesMap = new Map<string, TableSchema>();
     for (const table of tables) {
       tablesMap.set(table.name, table);
+    }
+
+    // Second pass: Resolve foreign key model names to table names
+    for (const table of tablesMap.values()) {
+      const resolvedForeignKeys: ForeignKey[] = [];
+      for (const foreignKey of table.foreignKeys) {
+        const resolvedTableName = modelToTableMap.get(foreignKey.toTable);
+        if (resolvedTableName) {
+          // Create a new foreign key object with resolved table name
+          resolvedForeignKeys.push({
+            ...foreignKey,
+            toTable: resolvedTableName,
+          });
+        } else {
+          // Keep the original if no mapping found
+          resolvedForeignKeys.push(foreignKey);
+        }
+      }
+      // Replace the foreign keys array
+      table.foreignKeys = resolvedForeignKeys;
     }
 
     return new DatabaseSchemaImpl(tablesMap);
@@ -85,16 +108,39 @@ export class DbSchemaParser {
   static parseSchemaContent(content: string): DatabaseSchema {
     try {
       const tables = new Map<string, TableSchema>();
+      const modelToTableMap = new Map<string, string>(); // Model name -> Table name mapping
 
       // Extract model definitions
       const modelMatches = content.matchAll(/model\s+(\w+)\s*{([^}]*)}/g);
 
+      // First pass: Parse models and build model-to-table mapping
       for (const match of modelMatches) {
         const modelName = match[1];
         const modelBody = match[2];
 
         const tableSchema = this.parseModel(modelName, modelBody);
         tables.set(tableSchema.name, tableSchema);
+        modelToTableMap.set(modelName, tableSchema.name); // Store mapping
+      }
+
+      // Second pass: Resolve foreign key model names to table names
+      for (const table of tables.values()) {
+        const resolvedForeignKeys: ForeignKey[] = [];
+        for (const foreignKey of table.foreignKeys) {
+          const resolvedTableName = modelToTableMap.get(foreignKey.toTable);
+          if (resolvedTableName) {
+            // Create a new foreign key object with resolved table name
+            resolvedForeignKeys.push({
+              ...foreignKey,
+              toTable: resolvedTableName,
+            });
+          } else {
+            // Keep the original if no mapping found
+            resolvedForeignKeys.push(foreignKey);
+          }
+        }
+        // Replace the foreign keys array
+        table.foreignKeys = resolvedForeignKeys;
       }
 
       return new DatabaseSchemaImpl(tables);
@@ -148,6 +194,11 @@ export class DbSchemaParser {
       }
     }
 
+    // Include table-level indexes from @@index attributes
+    if (modelAttributes.indexes) {
+      indexes.push(...modelAttributes.indexes);
+    }
+
     return {
       name: tableName,
       columns,
@@ -157,7 +208,7 @@ export class DbSchemaParser {
   }
 
   /**
-   * Parse model-level attributes (@@map, @@id, etc.)
+   * Parse model-level attributes (@@map, @@id, @@index, etc.)
    */
   private static parseModelAttributes(modelBody: string): PrismaModelAttribute {
     const attributes: PrismaModelAttribute = {};
@@ -174,7 +225,54 @@ export class DbSchemaParser {
       attributes.id = idMatch[1].split(',').map(f => f.trim().replace(/['"]/g, ''));
     }
 
+    // @@index([column], name: "index_name", type: Gist)
+    const indexes: Index[] = [];
+    const indexMatches = modelBody.match(/@@index\s*\([^)]+\)/g);
+    if (indexMatches) {
+      for (const indexMatch of indexMatches) {
+        const index = this.parseTableLevelIndex(indexMatch);
+        if (index) {
+          indexes.push(index);
+        }
+      }
+    }
+    if (indexes.length > 0) {
+      attributes.indexes = indexes;
+    }
+
     return attributes;
+  }
+
+  /**
+   * Parse a single @@index attribute
+   * Format: @@index([column1, column2], name: "index_name", type: Gist)
+   */
+  private static parseTableLevelIndex(indexAttribute: string): Index | null {
+    // Extract columns
+    const columnsMatch = indexAttribute.match(/\[([^\]]+)\]/);
+    if (!columnsMatch) return null;
+
+    const columns = columnsMatch[1].split(',').map(col => col.trim().replace(/['"]/g, ''));
+
+    // Extract name
+    const nameMatch = indexAttribute.match(/name:\s*"([^"]+)"/);
+    if (!nameMatch) return null;
+
+    const name = nameMatch[1];
+
+    // Extract type (optional, defaults to BTree)
+    const typeMatch = indexAttribute.match(/type:\s*(\w+)/);
+    const type = typeMatch ? (typeMatch[1] as 'BTree' | 'Gist' | 'Hash' | 'Gin') : undefined;
+
+    // Check for unique (optional)
+    const unique = indexAttribute.includes('unique:') && indexAttribute.includes('true');
+
+    return {
+      name,
+      columns,
+      unique,
+      type,
+    };
   }
 
   /**
@@ -372,6 +470,7 @@ class DatabaseSchemaImpl implements DatabaseSchema {
    */
   getTablesInDependencyOrder(): string[] {
     const tableNames = this.getTableNames();
+
     const visited = new Set<string>();
     const visiting = new Set<string>();
     const result: string[] = [];

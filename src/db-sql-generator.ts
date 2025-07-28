@@ -172,12 +172,13 @@ export class DbSqlGenerator {
    */
   private static generateCreateIndexStatement(
     tableName: string,
-    index: { name: string; columns: string[]; unique: boolean }
+    index: { name: string; columns: string[]; unique: boolean; type?: string }
   ): string {
     const uniqueClause = index.unique ? 'UNIQUE ' : '';
     const columnList = index.columns.map(col => `"${col}"`).join(', ');
+    const usingClause = index.type ? ` USING ${index.type.toUpperCase()}` : '';
 
-    return `CREATE ${uniqueClause}INDEX IF NOT EXISTS "${index.name}" ON "${tableName}" (${columnList});`;
+    return `CREATE ${uniqueClause}INDEX IF NOT EXISTS "${index.name}" ON "${tableName}"${usingClause} (${columnList});`;
   }
 
   /**

@@ -1355,7 +1355,17 @@ export class DatabaseMigrator {
 
           // Update index definition to use correct table name
           const tableName = table.tableName.replace('_shadow', '');
-          const indexDef = index.definition.replace(table.tableName, tableName);
+          let indexDef = index.definition.replace(table.tableName, tableName);
+
+          // Add IF NOT EXISTS to avoid conflicts with existing indexes
+          if (indexDef.startsWith('CREATE INDEX ')) {
+            indexDef = indexDef.replace('CREATE INDEX ', 'CREATE INDEX IF NOT EXISTS ');
+          } else if (indexDef.startsWith('CREATE UNIQUE INDEX ')) {
+            indexDef = indexDef.replace(
+              'CREATE UNIQUE INDEX ',
+              'CREATE UNIQUE INDEX IF NOT EXISTS '
+            );
+          }
 
           // Special handling for spatial indexes
           if (index.indexType === 'gist' || indexDef.includes('USING gist')) {

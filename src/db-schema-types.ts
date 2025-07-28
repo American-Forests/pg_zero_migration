@@ -25,6 +25,7 @@ export interface Index {
   name: string;
   columns: string[];
   unique: boolean;
+  type?: 'BTree' | 'Gist' | 'Hash' | 'Gin';
 }
 
 export interface TableSchema {
@@ -78,5 +79,6 @@ export interface PrismaModelAttribute {
   map?: string; // Custom table name
   id?: string[]; // Composite primary key
   unique?: string[]; // Composite unique constraint
-  index?: string[]; // Composite index
+  index?: string[]; // Composite index (deprecated)
+  indexes?: Index[]; // Table-level indexes with type support
 }

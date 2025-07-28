@@ -53,17 +53,17 @@ describe('Database Migration Integration Tests', () => {
     const originalFixture = JSON.parse(fs.readFileSync(originalFixturePath, 'utf-8'));
 
     const modifiedFixture = {
-      users: originalFixture.users.map((user: any) => ({
+      User: originalFixture.User.map((user: any) => ({
         ...user,
         name: `${user.name} Modified`,
         email: user.email.replace('@', '+modified@'),
       })),
-      posts: originalFixture.posts.map((post: any) => ({
+      Post: originalFixture.Post.map((post: any) => ({
         ...post,
         title: `Modified ${post.title}`,
         content: `Modified: ${post.content}`,
       })),
-      comments: originalFixture.comments.map((comment: any) => ({
+      Comment: originalFixture.Comment.map((comment: any) => ({
         ...comment,
         content: `Modified: ${comment.content}`,
       })),
@@ -128,16 +128,16 @@ describe('Database Migration Integration Tests', () => {
     const sourceCounts = await sourceLoader.getDataCounts();
     const destCounts = await destLoader.getDataCounts();
 
-    expect(sourceCounts.users).toBe(2);
-    expect(sourceCounts.posts).toBe(2);
-    expect(sourceCounts.comments).toBe(2);
+    expect(sourceCounts.User).toBe(2);
+    expect(sourceCounts.Post).toBe(2);
+    expect(sourceCounts.Comment).toBe(2);
 
-    expect(destCounts.users).toBe(2);
-    expect(destCounts.posts).toBe(2);
-    expect(destCounts.comments).toBe(2);
+    expect(destCounts.User).toBe(2);
+    expect(destCounts.Post).toBe(2);
+    expect(destCounts.Comment).toBe(2);
 
     // Check source data (original)
-    const sourceUsers = await sourceLoader.executeQuery('SELECT * FROM users ORDER BY id');
+    const sourceUsers = await sourceLoader.executeQuery('SELECT * FROM "User" ORDER BY id');
     expect(sourceUsers).toHaveLength(2);
     expect(sourceUsers[0].name).toBe('John Doe');
     expect(sourceUsers[0].email).toBe('john@example.com');
@@ -146,7 +146,7 @@ describe('Database Migration Integration Tests', () => {
 
     // Check destination data (modified)
     const destUsersBeforeMigration = await destLoader.executeQuery(
-      'SELECT * FROM users ORDER BY id'
+      'SELECT * FROM "User" ORDER BY id'
     );
     expect(destUsersBeforeMigration).toHaveLength(2);
     expect(destUsersBeforeMigration[0].name).toBe('John Doe Modified');
@@ -161,7 +161,7 @@ describe('Database Migration Integration Tests', () => {
 
     // Verify destination now contains source data
     const destUsersAfterMigration = await destLoader.executeQuery(
-      'SELECT * FROM users ORDER BY id'
+      'SELECT * FROM "User" ORDER BY id'
     );
     expect(destUsersAfterMigration).toHaveLength(2);
     expect(destUsersAfterMigration[0].name).toBe('John Doe');
@@ -170,7 +170,7 @@ describe('Database Migration Integration Tests', () => {
     expect(destUsersAfterMigration[1].email).toBe('jane@example.com');
 
     // Verify posts data
-    const destPosts = await destLoader.executeQuery('SELECT * FROM posts ORDER BY id');
+    const destPosts = await destLoader.executeQuery('SELECT * FROM "Post" ORDER BY id');
     expect(destPosts).toHaveLength(2);
     expect(destPosts[0].title).toBe('First Post');
     expect(destPosts[0].content).toBe('This is the first post');
@@ -178,7 +178,7 @@ describe('Database Migration Integration Tests', () => {
     expect(destPosts[1].content).toBe('This is the second post');
 
     // Verify comments data
-    const destComments = await destLoader.executeQuery('SELECT * FROM comments ORDER BY id');
+    const destComments = await destLoader.executeQuery('SELECT * FROM "Comment" ORDER BY id');
     expect(destComments).toHaveLength(2);
     expect(destComments[0].content).toBe('Great post!');
     expect(destComments[1].content).toBe('Nice work!');
@@ -188,17 +188,17 @@ describe('Database Migration Integration Tests', () => {
     const sourceSchemaCheck = await sourceLoader.executeQuery(`
       SELECT schemaname, tablename 
       FROM pg_tables 
-      WHERE tablename IN ('users', 'posts', 'comments')
+      WHERE tablename IN ('User', 'Post', 'Comment')
       ORDER BY tablename
     `);
 
     expect(sourceSchemaCheck).toHaveLength(3);
     expect(sourceSchemaCheck[0].schemaname).toBe('public');
-    expect(sourceSchemaCheck[0].tablename).toBe('comments');
+    expect(sourceSchemaCheck[0].tablename).toBe('Comment');
     expect(sourceSchemaCheck[1].schemaname).toBe('public');
-    expect(sourceSchemaCheck[1].tablename).toBe('posts');
+    expect(sourceSchemaCheck[1].tablename).toBe('Post');
     expect(sourceSchemaCheck[2].schemaname).toBe('public');
-    expect(sourceSchemaCheck[2].tablename).toBe('users');
+    expect(sourceSchemaCheck[2].tablename).toBe('User');
 
     // Verify no shadow schema exists in source database
     const shadowSchemaCheck = await sourceLoader.executeQuery(`
@@ -230,7 +230,7 @@ describe('Database Migration Integration Tests', () => {
     await destLoader.loadTestData();
 
     // Get initial destination data (should be modified)
-    const destUsersBeforeDryRun = await destLoader.executeQuery('SELECT * FROM users ORDER BY id');
+    const destUsersBeforeDryRun = await destLoader.executeQuery('SELECT * FROM "User" ORDER BY id');
     expect(destUsersBeforeDryRun).toHaveLength(2);
     expect(destUsersBeforeDryRun[0].name).toBe('John Doe Modified');
 
