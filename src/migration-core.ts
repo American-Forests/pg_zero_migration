@@ -880,7 +880,11 @@ export class DatabaseMigrator {
 
         if (tableExists.rows[0].exists) {
           // Step 1: Clear shadow table and copy current data
+          // Temporarily disable foreign key constraints for this operation
+          await client.query('SET session_replication_role = replica');
           await client.query(`DELETE FROM shadow."${actualTableName}"`);
+          await client.query('SET session_replication_role = origin');
+
           await client.query(
             `INSERT INTO shadow."${actualTableName}" SELECT * FROM public."${actualTableName}"`
           );

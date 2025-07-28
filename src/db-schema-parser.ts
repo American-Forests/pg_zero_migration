@@ -235,15 +235,45 @@ export class DbSchemaParser {
       !PRISMA_TO_POSTGRES[relationMatch[1]] &&
       !enumTypes.has(relationMatch[1])
     ) {
-      // Look for @relation attribute to determine foreign key details
+      // This is a relation field - check for @relation attribute
       const relationAttr = fieldDefinition.match(/@relation\s*\([^)]+\)/);
       if (relationAttr) {
-        // This might be the "other side" of the relation
-        return {};
+        // Parse the @relation attribute to extract foreign key information
+        const relationText = relationAttr[0];
+        const fieldsMatch = relationText.match(/fields:\s*\[([^\]]+)\]/);
+        const referencesMatch = relationText.match(/references:\s*\[([^\]]+)\]/);
+        const onDeleteMatch = relationText.match(/onDelete:\s*(\w+)/);
+        const onUpdateMatch = relationText.match(/onUpdate:\s*(\w+)/);
+
+        if (fieldsMatch && referencesMatch) {
+          // Extract field names and referenced columns
+          const fields = fieldsMatch[1].split(',').map(f => f.trim().replace(/['"]/g, ''));
+          const references = referencesMatch[1].split(',').map(r => r.trim().replace(/['"]/g, ''));
+
+          // Create foreign key constraint for each field-reference pair
+          if (fields.length === references.length) {
+            const foreignKeys: ForeignKey[] = [];
+            for (let i = 0; i < fields.length; i++) {
+              const foreignKey: ForeignKey = {
+                fromColumn: fields[i],
+                toTable: relationMatch[1], // The target model name
+                toColumn: references[i],
+                onDelete: onDeleteMatch
+                  ? (onDeleteMatch[1] as 'CASCADE' | 'SET NULL' | 'RESTRICT')
+                  : undefined,
+                onUpdate: onUpdateMatch
+                  ? (onUpdateMatch[1] as 'CASCADE' | 'SET NULL' | 'RESTRICT')
+                  : undefined,
+              };
+              foreignKeys.push(foreignKey);
+            }
+            return { foreignKey: foreignKeys[0] }; // Return first FK for single-column relations
+          }
+        }
       }
 
-      // This is a relation field without @relation attribute
-      // In Prisma, these don't create actual columns, just navigation properties
+      // This is a relation field without proper @relation attribute or navigation property
+      // These don't create actual columns, just navigation properties
       return {};
     }
 
