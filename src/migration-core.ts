@@ -106,7 +106,7 @@ export class DatabaseMigrator {
     this.destConfig = destConfig;
     this.sourcePool = new Pool(this.sourceConfig);
     this.destPool = new Pool(this.destConfig);
-    this.preservedTables = new Set(preservedTables.map(t => t.toLowerCase()));
+    this.preservedTables = new Set(preservedTables);
     this.tempDir = '/tmp';
     this.dryRun = dryRun;
     this.stats = {
@@ -745,7 +745,7 @@ export class DatabaseMigrator {
         const backupTableName = `${tableName}_backup_${timestamp}`;
 
         try {
-          // Check if table exists
+          // Check if table exists (handle case-sensitive table names)
           const tableExists = await client.query(
             `
             SELECT EXISTS (
