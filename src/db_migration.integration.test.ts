@@ -330,7 +330,12 @@ describe('TES Schema Migration Integration Tests', () => {
     // Initialize migrator
     const sourceConfig = parseDatabaseUrl(expectedSourceUrl);
     const destConfig = parseDatabaseUrl(expectedDestUrl);
-    migrator = new DatabaseMigrator(sourceConfig, destConfig);
+    migrator = new DatabaseMigrator(sourceConfig, destConfig, [
+      'BlockgroupOnScenario',
+      'AreaOnScenario',
+      'Scenario',
+      'User',
+    ]);
 
     // Note: Don't clean up temporary modified fixture file here - it's needed for the tests
   }, 60000); // Increase timeout for TES schema setup
@@ -420,15 +425,15 @@ describe('TES Schema Migration Integration Tests', () => {
     await migrator.migrate();
     console.log('TES migration completed successfully');
 
-    // Verify destination now contains source TES data
+    // Verify destination contains preserved User data (since User is a preserved table)
     const destUsersAfterMigration = await destLoader.executeQuery(
       'SELECT * FROM "User" ORDER BY id'
     );
     expect(destUsersAfterMigration).toHaveLength(4);
-    expect(destUsersAfterMigration[0].name).toBe('John Doe');
-    expect(destUsersAfterMigration[0].email).toBe('john.doe@example.com');
-    expect(destUsersAfterMigration[1].name).toBe('Jane Smith');
-    expect(destUsersAfterMigration[1].email).toBe('jane.smith@example.com');
+    expect(destUsersAfterMigration[0].name).toBe('John Doe Modified');
+    expect(destUsersAfterMigration[0].email).toBe('john.doe+modified@example.com');
+    expect(destUsersAfterMigration[1].name).toBe('Jane Smith Modified');
+    expect(destUsersAfterMigration[1].email).toBe('jane.smith+modified@example.com');
 
     const destBlockgroupsAfterMigration = await destLoader.executeQuery(
       'SELECT * FROM "Blockgroup" ORDER BY gid'
