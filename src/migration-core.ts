@@ -143,7 +143,7 @@ export class DatabaseMigrator {
       }
 
       // Perform actual migration
-      await this.performCompleteMigration(sourceTables, destTables);
+      await this.doMigration(sourceTables, destTables);
 
       this.stats.endTime = new Date();
       this.logSummary();
@@ -437,35 +437,35 @@ export class DatabaseMigrator {
   /**
    * Perform the complete migration using schema-based approach with real-time sync
    */
-  private async performCompleteMigration(
-    sourceTables: TableInfo[],
-    destTables: TableInfo[]
-  ): Promise<void> {
+  private async doMigration(sourceTables: TableInfo[], destTables: TableInfo[]): Promise<void> {
     this.log('🔄 Starting database migration...');
 
     const timestamp = Date.now();
 
     try {
-      // Phase 1: Create shadow schema and restore source data with parallelization
-      await this.createShadowSchemaAndRestore(sourceTables, timestamp);
+      // Phase 1: Create source dump
+      const dumpPath = await this.createSourceDump(sourceTables, timestamp);
 
-      // Phase 2A: Copy preserved tables to shadow and setup real-time sync
+      // Phase 2: Restore source dump to destination shadow schema
+      await this.restoreToDestinationShadow(sourceTables, dumpPath);
+
+      // Phase 3: Setup preserved table synchronization
       await this.setupPreservedTableSync(destTables, timestamp);
 
-      // Phase 2B: Backup preserved table data (for rollback safety)
+      // Phase 4: Backup preserved table data (for rollback safety)
       await this.backupPreservedTableData(destTables, timestamp);
 
-      // Phase 3: Perform atomic schema swap (zero downtime!)
+      // Phase 5: Perform atomic schema swap (zero downtime!)
       await this.performAtomicSchemaSwap(timestamp);
 
-      // Phase 4: Cleanup sync triggers and validate consistency
+      // Phase 6: Cleanup sync triggers and validate consistency
       await this.cleanupSyncTriggersAndValidate(timestamp);
 
-      // Phase 5: Reset sequences and recreate indexes
-      this.log('🔢 Phase 5: Resetting sequences...');
+      // Phase 7: Reset sequences and recreate indexes
+      this.log('🔢 Phase 7: Resetting sequences...');
       await this.resetSequences(sourceTables);
 
-      this.log('🗂️  Phase 6: Recreating indexes...');
+      this.log('🗂️  Phase 8: Recreating indexes...');
       await this.recreateIndexes(sourceTables);
 
       // Disable destination write protection after all critical phases complete
@@ -507,88 +507,101 @@ export class DatabaseMigrator {
   }
 
   /**
-   * Phase 1: Create shadow schema and restore source data with full parallelization
+   * Phase 1: Create source dump from source database
    */
-  private async createShadowSchemaAndRestore(
+  private async createSourceDump(sourceTables: TableInfo[], timestamp: number): Promise<string> {
+    this.log('🔧 Phase 1: Creating source dump...');
+
+    try {
+      // Prepare source database by moving tables to shadow schema
+      await this.prepareSourceForShadowDump(sourceTables);
+
+      // Enable write protection on source database for safety during dump/restore process
+      await this.enableWriteProtection();
+
+      // Create binary dump for maximum efficiency and parallelization
+      const dumpPath = join(this.tempDir, `source_dump_${timestamp}.backup`);
+      await this.createBinaryDump(dumpPath);
+
+      // Disable write protection before restoring source database structure
+      await this.disableWriteProtection();
+
+      // Restore source database tables back to public schema
+      await this.restoreSourceFromShadowDump(sourceTables);
+
+      this.log('✅ Source dump created successfully');
+      return dumpPath;
+    } catch (error) {
+      // Always remove write protection from source database, even if migration fails
+      await this.disableWriteProtection();
+      throw error;
+    }
+  }
+
+  /**
+   * Phase 2: Restore source dump to destination shadow schema
+   */
+  private async restoreToDestinationShadow(
     sourceTables: TableInfo[],
-    timestamp: number
+    dumpPath: string
   ): Promise<void> {
-    this.log('🔧 Phase 1: Creating shadow schema and restoring source data...');
+    this.log('🔧 Phase 2: Restoring source data to destination shadow schema...');
 
     const client = await this.destPool.connect();
 
     try {
-      // Enable write protection on destination database at the start of Phase 1
+      // Enable write protection on destination database at the start of Phase 1B
       await this.enableDestinationWriteProtection();
 
       // Disable foreign key constraints for the destination database during setup
       await this.disableForeignKeyConstraints(this.destPool);
 
-      try {
-        // Prepare source database by moving tables to shadow schema
-        await this.prepareSourceForShadowDump(sourceTables);
+      // Drop and recreate shadow schema on destination before restore
+      this.log('⚠️  Dropping existing shadow schema on destination (if exists)');
+      await client.query('DROP SCHEMA IF EXISTS shadow CASCADE;');
+      this.log('✅ Shadow schema dropped - will be recreated by pg_restore');
 
-        // Enable write protection on source database for safety during dump/restore process
-        await this.enableWriteProtection();
+      // Restore shadow schema data with full parallelization
+      const jobCount = Math.min(8, cpus().length);
+      this.log(`🚀 Restoring with ${jobCount} parallel jobs...`);
 
-        // Create binary dump for maximum efficiency and parallelization
-        const dumpPath = join(this.tempDir, `source_dump_${timestamp}.backup`);
-        await this.createBinaryDump(dumpPath);
+      const restoreArgs = [
+        '--jobs',
+        jobCount.toString(),
+        '--format',
+        'custom',
+        '--no-privileges',
+        '--no-owner',
+        '--disable-triggers',
+        '--dbname',
+        this.destConfig.database,
+        '--host',
+        this.destConfig.host,
+        '--port',
+        this.destConfig.port.toString(),
+        '--username',
+        this.destConfig.user,
+        dumpPath,
+      ];
 
-        // Drop and recreate shadow schema on destination before restore
-        this.log('⚠️  Dropping existing shadow schema on destination (if exists)');
-        await client.query('DROP SCHEMA IF EXISTS shadow CASCADE;');
-        this.log('✅ Shadow schema dropped - will be recreated by pg_restore');
+      const restoreEnv = {
+        ...process.env,
+        PGPASSWORD: this.destConfig.password,
+      };
 
-        // Restore shadow schema data with full parallelization
-        const jobCount = Math.min(8, cpus().length);
-        this.log(`🚀 Restoring with ${jobCount} parallel jobs...`);
+      await execa('pg_restore', restoreArgs, { env: restoreEnv });
+      this.log('✅ Source data restored to shadow schema with parallelization');
 
-        const restoreArgs = [
-          '--jobs',
-          jobCount.toString(),
-          '--format',
-          'custom',
-          '--no-privileges',
-          '--no-owner',
-          '--disable-triggers',
-          '--dbname',
-          this.destConfig.database,
-          '--host',
-          this.destConfig.host,
-          '--port',
-          this.destConfig.port.toString(),
-          '--username',
-          this.destConfig.user,
-          dumpPath,
-        ];
-
-        const restoreEnv = {
-          ...process.env,
-          PGPASSWORD: this.destConfig.password,
-        };
-
-        await execa('pg_restore', restoreArgs, { env: restoreEnv });
-        this.log('✅ Source data restored to shadow schema with parallelization');
-
-        // Disable write protection before restoring source database structure
-        await this.disableWriteProtection();
-
-        // Restore source database tables back to public schema
-        await this.restoreSourceFromShadowDump(sourceTables);
-
-        // Clean up dump file
-        if (existsSync(dumpPath)) {
-          unlinkSync(dumpPath);
-        }
-
-        // Update statistics
-        this.stats.tablesProcessed = sourceTables.length;
-        await this.updateRecordsMigratedCount(sourceTables);
-      } finally {
-        // Always remove write protection from source database, even if migration fails
-        await this.disableWriteProtection();
+      // Clean up dump file
+      if (existsSync(dumpPath)) {
+        unlinkSync(dumpPath);
       }
+
+      // Update statistics
+      this.stats.tablesProcessed = sourceTables.length;
+      await this.updateRecordsMigratedCount(sourceTables);
+
+      this.log('✅ Destination shadow schema restore completed');
     } finally {
       client.release();
     }
@@ -723,7 +736,7 @@ export class DatabaseMigrator {
   }
 
   /**
-   * Phase 2: Backup preserved table data before schema swap
+   * Phase 4: Backup preserved table data before schema swap
    */
   private async backupPreservedTableData(
     destTables: TableInfo[],
@@ -734,7 +747,7 @@ export class DatabaseMigrator {
       return;
     }
 
-    this.log('💾 Phase 2: Backing up preserved table data...');
+    this.log('💾 Phase 4: Backing up preserved table data...');
 
     const client = await this.destPool.connect();
 
@@ -786,10 +799,10 @@ export class DatabaseMigrator {
   }
 
   /**
-   * Phase 3: Perform atomic schema swap
+   * Phase 5: Perform atomic schema swap
    */
   private async performAtomicSchemaSwap(timestamp: number): Promise<void> {
-    this.log('🔄 Phase 3: Performing atomic schema swap...');
+    this.log('🔄 Phase 5: Performing atomic schema swap...');
 
     const client = await this.destPool.connect();
 
@@ -820,7 +833,7 @@ export class DatabaseMigrator {
   }
 
   /**
-   * Phase 2A: Setup preserved table synchronization
+   * Phase 3: Setup preserved table synchronization
    */
   private async setupPreservedTableSync(destTables: TableInfo[], timestamp: number): Promise<void> {
     if (this.preservedTables.size === 0) {
@@ -828,7 +841,7 @@ export class DatabaseMigrator {
       return;
     }
 
-    this.log(`🔄 Phase 2A: Setting up preserved table synchronization (backup_${timestamp})...`);
+    this.log(`🔄 Phase 3: Setting up preserved table synchronization (backup_${timestamp})...`);
 
     // Validate preserved tables exist in destination schema
     const missingTables = [];
@@ -1000,7 +1013,7 @@ export class DatabaseMigrator {
   }
 
   /**
-   * Phase 4: Cleanup sync triggers and validate consistency
+   * Phase 6: Cleanup sync triggers and validate consistency
    */
   private async cleanupSyncTriggersAndValidate(timestamp: number): Promise<void> {
     if (this.activeSyncTriggers.length === 0) {
@@ -1009,7 +1022,7 @@ export class DatabaseMigrator {
     }
 
     this.log(
-      `🧹 Phase 4: Cleaning up sync triggers and validating consistency (backup_${timestamp})...`
+      `🧹 Phase 6: Cleaning up sync triggers and validating consistency (backup_${timestamp})...`
     );
 
     try {

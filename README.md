@@ -18,41 +18,58 @@ The Database Migration Tool provides enterprise-grade database migration capabil
 
 ## How It Works
 
-The migration process follows a carefully orchestrated multi-phase approach:
+The migration process follows a carefully orchestrated 8-phase approach:
 
-### Phase 1: Shadow Schema Preparation
+### Phase 1: Create Source Dump
 
-1. **Source Preparation**: Tables are temporarily moved from `public` to `shadow` schema on the source database
-2. **Binary Dump Creation**: Creates a high-performance binary dump using `pg_dump` with custom format
-3. **Destination Setup**: Drops existing shadow schema on destination and disables foreign key constraints
-4. **Parallel Restoration**: Uses `pg_restore` with multiple parallel jobs to restore data to shadow schema
-5. **Source Cleanup**: Restores source database tables back to public schema
+1. **Source Preparation**: Source database tables are temporarily made read-only and moved from `public` to `shadow` schema.  This is necessary for dump to be restored to shadow in destination
+2. **Binary Dump Creation**: Creates a high-performance binary dump using `pg_dump`
+3. **Source Restoration**: Restores source database tables back to public schema
 
-### Phase 2: Data Synchronization
+### Phase 2: Restore Source Dump to Destination Shadow Schema
 
-1. **Preserved Table Backup**: Backs up any tables marked for preservation
-2. **Constraint Management**: Handles foreign key relationships during migration
-3. **Data Validation**: Verifies data integrity between source and destination
+1. **Destination Setup**: Drops existing shadow schema on destination and disables foreign key constraints
+2. **Parallel Restoration**: Uses `pg_restore` with multiple parallel jobs to restore data to shadow schema
 
-### Phase 3: Atomic Schema Swap
+### Phase 3: Setup Preserved Table Synchronization
+
+1. **Preserved Table Validation**: Validates that preserved tables exist in destination schema
+2. **Real-time Sync Setup**: Creates triggers for real-time synchronization of preserved tables
+3. **Initial Sync**: Copies current preserved table data to shadow schema
+
+### Phase 4: Backup Preserved Table Data
+
+1. **Preserved Table Backup**: Backs up any tables marked for preservation before schema swap
+2. **Backup Validation**: Verifies backup data integrity
+
+### Phase 5: Perform Atomic Schema Swap
 
 1. **Backup Creation**: Moves current public schema to timestamped backup schema
 2. **Schema Activation**: Promotes shadow schema to become the new public schema  
 3. **New Shadow Creation**: Creates fresh shadow schema for future migrations
 
-### Phase 4: Post-Migration Tasks
+### Phase 6: Cleanup Sync Triggers and Validate Consistency
 
-1. **Sequence Reset**: Synchronizes all sequence values to match source database
-2. **Index Recreation**: Rebuilds indexes for optimal performance
+1. **Trigger Cleanup**: Removes real-time sync triggers from preserved tables
+2. **Data Validation**: Validates consistency between migrated data
+
+### Phase 7: Reset Sequences
+
+1. **Sequence Synchronization**: Synchronizes all sequence values to match source database
+2. **Sequence Validation**: Verifies sequence values are correctly set
+
+### Phase 8: Recreate Indexes
+
+1. **Index Recreation**: Rebuilds indexes for optimal performance
+2. **Spatial Index Handling**: Special handling for PostGIS spatial indexes
 3. **Constraint Re-enabling**: Restores foreign key constraints
-4. **Cleanup**: Removes temporary files and closes connections
 
 ## Key Features
 
 ### Zero-Downtime Operation
 
 - Uses atomic schema swapping to minimize service interruption
-- Shadow schema strategy ensures production data remains available
+- Shadow schema strategy ensures production data remains available during dump/restore
 - Rollback capabilities protect against migration failures
 
 ### High-Performance Processing
