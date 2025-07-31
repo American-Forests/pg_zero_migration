@@ -421,9 +421,222 @@ describe('TES Schema Migration Integration Tests', () => {
     expect(destGeomCheck[0].geom_text).toContain('MULTIPOLYGON');
 
     // Perform migration
+
+    // --- Pre-Migration Preserved Table Validation ---
+    console.log('Validating preserved table configuration BEFORE migration...');
+
+    // Verify preserved tables exist in destination database
+    const preservedTables = ['User', 'Scenario', 'AreaOnScenario', 'BlockgroupOnScenario'];
+    const destTablesForPreserved = await destLoader.executeQuery(`
+      SELECT table_name FROM information_schema.tables 
+      WHERE table_schema = 'public' 
+      AND table_type = 'BASE TABLE'
+      AND table_name NOT LIKE 'spatial_%'
+    `);
+
+    const availableDestTables = destTablesForPreserved.map(
+      (t: { table_name: string }) => t.table_name
+    );
+    console.log(
+      `📊 Available destination tables (${availableDestTables.length}):`,
+      availableDestTables.sort()
+    );
+
+    for (const preservedTable of preservedTables) {
+      if (!availableDestTables.includes(preservedTable)) {
+        throw new Error(`❌ Preserved table '${preservedTable}' not found in destination database`);
+      }
+    }
+
+    // Verify preserved tables have data (prevent empty table migration)
+    for (const preservedTable of preservedTables) {
+      const tableData = await destLoader.executeQuery(
+        `SELECT COUNT(*) as count FROM "${preservedTable}"`
+      );
+      const recordCount = parseInt(tableData[0].count);
+
+      if (recordCount === 0) {
+        console.log(
+          `⚠️ Preserved table '${preservedTable}' is empty - this may indicate a configuration issue`
+        );
+      } else {
+        console.log(`✅ Preserved table '${preservedTable}' has ${recordCount} records`);
+      }
+    }
+
+    // Verify preserved tables don't have conflicting foreign key relationships that could break
+    console.log('🔗 Validating preserved table foreign key constraints...');
+    const fkConstraints = await destLoader.executeQuery(
+      `
+      SELECT 
+        tc.table_name, 
+        kcu.column_name, 
+        ccu.table_name AS foreign_table_name,
+        ccu.column_name AS foreign_column_name 
+      FROM 
+        information_schema.table_constraints AS tc 
+        JOIN information_schema.key_column_usage AS kcu
+          ON tc.constraint_name = kcu.constraint_name
+          AND tc.table_schema = kcu.table_schema
+        JOIN information_schema.constraint_column_usage AS ccu
+          ON ccu.constraint_name = tc.constraint_name
+          AND ccu.table_schema = tc.table_schema
+      WHERE tc.constraint_type = 'FOREIGN KEY'
+        AND tc.table_name = ANY($1)
+    `,
+      [preservedTables]
+    );
+
+    for (const fk of fkConstraints) {
+      if (!preservedTables.includes(fk.foreign_table_name)) {
+        console.log(
+          `⚠️ Preserved table '${fk.table_name}' references non-preserved table '${fk.foreign_table_name}' - potential data consistency issue`
+        );
+      } else {
+        console.log(
+          `✅ FK constraint validated: ${fk.table_name}.${fk.column_name} -> ${fk.foreign_table_name}`
+        );
+      }
+    }
+
+    console.log('✅ Pre-Migration Preserved Table Validation completed');
+
+    // --- Backup Schema Completeness Validation (before migration) ---
+    console.log('Validating backup schema completeness BEFORE migration...');
+    // Get list of tables in destination public schema (excluding system tables)
+    const destTablesBefore = await destLoader.executeQuery(`
+      SELECT table_name FROM information_schema.tables 
+      WHERE table_schema = 'public' 
+        AND table_type = 'BASE TABLE'
+        AND table_name NOT IN ('spatial_ref_sys', 'geography_columns', 'geometry_columns', 'raster_columns', 'raster_overviews')
+      ORDER BY table_name
+    `);
+    expect(destTablesBefore.length).toBeGreaterThan(0);
+    const destTableNames = destTablesBefore.map((row: { table_name: string }) => row.table_name);
+    console.log(
+      `📊 Destination tables before migration (${destTableNames.length}):`,
+      destTableNames
+    );
+
+    // Get row counts for each table in destination public schema
+    const destTableCounts: Record<string, number> = {};
+    for (const table of destTableNames) {
+      const countRes = await destLoader.executeQuery(`SELECT COUNT(*) as count FROM "${table}"`);
+      destTableCounts[table] = parseInt(countRes[0].count);
+    }
+
+    // Perform migration
     console.log('Starting TES schema migration...');
     await migrator.migrate();
     console.log('TES migration completed successfully');
+
+    // --- Backup Schema Completeness Validation (after migration) ---
+    console.log('Validating backup schema completeness AFTER migration...');
+    // Find backup schema name
+    const backupSchemas = await destLoader.executeQuery(`
+      SELECT schema_name FROM information_schema.schemata WHERE schema_name LIKE 'backup_%' ORDER BY schema_name DESC
+    `);
+    expect(backupSchemas.length).toBeGreaterThan(0);
+    const backupSchema = backupSchemas[0].schema_name;
+
+    // Get list of tables in backup schema (excluding system tables and temporary backup tables)
+    const backupTables = await destLoader.executeQuery(`
+      SELECT table_name FROM information_schema.tables 
+      WHERE table_schema = '${backupSchema}' 
+        AND table_type = 'BASE TABLE'
+        AND table_name NOT IN ('spatial_ref_sys', 'geography_columns', 'geometry_columns', 'raster_columns', 'raster_overviews')
+        AND table_name NOT LIKE '%_backup_%'
+      ORDER BY table_name
+    `);
+    const backupTableNames = backupTables.map((row: { table_name: string }) => row.table_name);
+    console.log(`📊 Backup schema tables (${backupTableNames.length}):`, backupTableNames);
+
+    // Also get the temporary backup tables created for preserved tables during migration
+    const preservedBackupTables = await destLoader.executeQuery(`
+      SELECT table_name FROM information_schema.tables 
+      WHERE table_schema = '${backupSchema}' 
+        AND table_type = 'BASE TABLE'
+        AND table_name LIKE '%_backup_%'
+      ORDER BY table_name
+    `);
+    if (preservedBackupTables.length > 0) {
+      console.log(
+        `📦 Preserved table backup tables (${preservedBackupTables.length}):`,
+        preservedBackupTables.map((row: { table_name: string }) => row.table_name)
+      );
+    }
+
+    // Check table count difference and provide detailed logging if mismatch
+    if (backupTables.length !== destTablesBefore.length) {
+      console.log('⚠️  Table count mismatch detected!');
+      const destSet = new Set(destTableNames);
+      const backupSet = new Set(backupTableNames);
+
+      const missingInBackup = destTableNames.filter(t => !backupSet.has(t));
+      const extraInBackup = backupTableNames.filter(t => !destSet.has(t));
+
+      if (missingInBackup.length > 0) {
+        console.log('❌ Tables missing in backup schema:', missingInBackup);
+      }
+      if (extraInBackup.length > 0) {
+        console.log('➕ Extra tables in backup schema:', extraInBackup);
+      }
+    }
+
+    expect(backupTables.length).toBe(destTablesBefore.length);
+
+    // Check that all original destination tables are present in backup schema
+    for (const table of destTableNames) {
+      expect(backupTableNames).toContain(table);
+    }
+
+    // Compare row counts for each table in backup schema vs original destination
+    for (const table of destTableNames) {
+      const backupCountRes = await destLoader.executeQuery(
+        `SELECT COUNT(*) as count FROM "${backupSchema}"."${table}"`
+      );
+      const backupCount = parseInt(backupCountRes[0].count);
+      expect(backupCount).toBe(destTableCounts[table]);
+    }
+
+    // Optionally: Check for geometry columns and spatial indexes in backup schema
+    try {
+      const backupGeomColumns = await destLoader.executeQuery(`
+        SELECT f_table_name, f_geometry_column FROM geometry_columns WHERE f_table_schema = '${backupSchema}'
+      `);
+      if (backupGeomColumns.length > 0) {
+        console.log(
+          `✅ Geometry columns found in backup schema:`,
+          backupGeomColumns.map((r: { f_table_name: string }) => r.f_table_name)
+        );
+      } else {
+        console.log('⚠️  No geometry columns found in backup schema');
+      }
+    } catch {
+      console.log(
+        'ℹ️ PostGIS geometry_columns view not available in backup schema, skipping spatial features validation'
+      );
+    }
+
+    // Check for spatial indexes in backup schema
+    const backupSpatialIndexes = await destLoader.executeQuery(`
+      SELECT t.relname as table_name, i.relname as index_name, am.amname as index_type
+      FROM pg_class t
+      JOIN pg_index ix ON t.oid = ix.indrelid
+      JOIN pg_class i ON i.oid = ix.indexrelid
+      JOIN pg_am am ON i.relam = am.oid
+      WHERE am.amname = 'gist'
+        AND t.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = '${backupSchema}')
+      ORDER BY t.relname, i.relname
+    `);
+    if (backupSpatialIndexes.length > 0) {
+      console.log(
+        `✅ Spatial indexes found in backup schema:`,
+        backupSpatialIndexes.map((r: { index_name: string }) => r.index_name)
+      );
+    } else {
+      console.log('⚠️  No spatial indexes found in backup schema');
+    }
 
     // Verify destination contains preserved User data (since User is a preserved table)
     const destUsersAfterMigration = await destLoader.executeQuery(
@@ -474,7 +687,7 @@ describe('TES Schema Migration Integration Tests', () => {
     `);
 
     expect(sourceSchemaCheck.length).toBeGreaterThan(0);
-    sourceSchemaCheck.forEach((table: any) => {
+    sourceSchemaCheck.forEach((table: { schemaname: string; tablename: string }) => {
       expect(table.schemaname).toBe('public');
     });
 
