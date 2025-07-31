@@ -2,7 +2,14 @@
 
 import { Client } from 'pg';
 import { parseArgs } from 'node:util';
-import { DatabaseMigrator, parseDatabaseUrl, DatabaseConfig } from './migration-core.js';
+import { writeFileSync } from 'fs';
+import { join } from 'path';
+import {
+  DatabaseMigrator,
+  parseDatabaseUrl,
+  DatabaseConfig,
+  MigrationResult,
+} from './migration-core.js';
 import { DatabaseRollback } from './db-rollback.js';
 import { fileURLToPath } from 'url';
 interface BackupInfo {
@@ -311,6 +318,73 @@ Date Formats:
 `);
 }
 
+/**
+ * Write migration log to disk file
+ */
+function writeLogFile(
+  result: MigrationResult,
+  sourceConfig: DatabaseConfig,
+  destConfig: DatabaseConfig
+): void {
+  try {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const sourceDb = sourceConfig.database.replace(/[^a-zA-Z0-9]/g, '_');
+    const destDb = destConfig.database.replace(/[^a-zA-Z0-9]/g, '_');
+    const logFilePath = join(process.cwd(), `migration_${timestamp}_${sourceDb}_to_${destDb}.log`);
+
+    const duration = result.stats.endTime
+      ? (result.stats.endTime.getTime() - result.stats.startTime.getTime()) / 1000
+      : 0;
+
+    const outcome = result.success ? 'SUCCESS' : 'FAILED';
+
+    // Create log file header
+    const header = [
+      '='.repeat(80),
+      'DATABASE MIGRATION LOG',
+      '='.repeat(80),
+      `Migration Outcome: ${outcome}`,
+      `Start Time: ${result.stats.startTime.toISOString()}`,
+      `End Time: ${result.stats.endTime?.toISOString() || 'N/A'}`,
+      `Duration: ${duration}s`,
+      '',
+      'Source Database:',
+      `  Host: ${sourceConfig.host}:${sourceConfig.port}`,
+      `  Database: ${sourceConfig.database}`,
+      `  User: ${sourceConfig.user}`,
+      '',
+      'Destination Database:',
+      `  Host: ${destConfig.host}:${destConfig.port}`,
+      `  Database: ${destConfig.database}`,
+      `  User: ${destConfig.user}`,
+      '',
+      'Migration Statistics:',
+      `  Tables Processed: ${result.stats.tablesProcessed}`,
+      `  Records Migrated: ${result.stats.recordsMigrated}`,
+      `  Warnings: ${result.stats.warnings.length}`,
+      `  Errors: ${result.stats.errors.length}`,
+      '',
+      '='.repeat(80),
+      'MIGRATION LOG DETAILS',
+      '='.repeat(80),
+      '',
+    ];
+
+    // Create log file footer
+    const footer = ['', '='.repeat(80), 'END OF MIGRATION LOG', '='.repeat(80)];
+
+    // Combine header, log buffer, and footer
+    const logContent = [...header, ...result.logs, ...footer].join('\n');
+
+    // Write to file
+    writeFileSync(logFilePath, logContent, 'utf8');
+
+    console.log(`📄 Migration log written to: ${logFilePath}`);
+  } catch (error) {
+    console.error(`Warning: Failed to write log file: ${error}`);
+  }
+}
+
 async function main(): Promise<void> {
   try {
     const { values, positionals } = parseArgs({
@@ -392,13 +466,21 @@ async function handleStartCommand(values: ParsedArgs, dryRun: boolean): Promise<
   const migrator = new DatabaseMigrator(sourceConfig, destConfig, preservedTables, dryRun);
 
   try {
-    await migrator.migrate();
+    const result = await migrator.migrate();
 
-    console.log('\n✅ Migration completed successfully!');
-    console.log('📦 Schema backup retained for rollback purposes');
-    process.exit(0);
+    // Write log file to disk
+    writeLogFile(result, sourceConfig, destConfig);
+
+    if (result.success) {
+      console.log('\n✅ Migration completed successfully!');
+      console.log('📦 Schema backup retained for rollback purposes');
+      process.exit(0);
+    } else {
+      console.error('\n❌ Migration failed:', result.error);
+      process.exit(1);
+    }
   } catch (error) {
-    console.error('\n❌ Migration failed:', error);
+    console.error('\n❌ Migration failed with unexpected error:', error);
     process.exit(1);
   }
 }

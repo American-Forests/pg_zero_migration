@@ -66,6 +66,13 @@ export interface MigrationStats {
   warnings: string[];
 }
 
+export interface MigrationResult {
+  success: boolean;
+  stats: MigrationStats;
+  logs: string[];
+  error?: string;
+}
+
 export interface SyncTriggerInfo {
   tableName: string;
   functionName: string;
@@ -95,6 +102,7 @@ export class DatabaseMigrator {
   private tempDir: string;
   private dryRun: boolean;
   private activeSyncTriggers: SyncTriggerInfo[] = [];
+  private logBuffer: string[] = [];
 
   constructor(
     sourceConfig: DatabaseConfig,
@@ -109,6 +117,7 @@ export class DatabaseMigrator {
     this.preservedTables = new Set(preservedTables);
     this.tempDir = '/tmp';
     this.dryRun = dryRun;
+
     this.stats = {
       startTime: new Date(),
       tablesProcessed: 0,
@@ -121,7 +130,7 @@ export class DatabaseMigrator {
   /**
    * Main migration method
    */
-  async migrate(): Promise<void> {
+  async migrate(): Promise<MigrationResult> {
     try {
       this.log('🚀 Starting database migration...');
       this.log(`📊 Dry run mode: ${this.dryRun ? 'ENABLED' : 'DISABLED'}`);
@@ -139,7 +148,11 @@ export class DatabaseMigrator {
 
       if (this.dryRun) {
         await this.performDryRun(sourceTables, destTables);
-        return;
+        return {
+          success: true,
+          stats: this.stats,
+          logs: [...this.logBuffer],
+        };
       }
 
       // Perform actual migration
@@ -147,9 +160,23 @@ export class DatabaseMigrator {
 
       this.stats.endTime = new Date();
       this.logSummary();
+
+      this.log('✅ Migration completed successfully');
+
+      return {
+        success: true,
+        stats: this.stats,
+        logs: [...this.logBuffer],
+      };
     } catch (error) {
       this.logError('Migration failed', error);
-      throw error;
+
+      return {
+        success: false,
+        stats: this.stats,
+        logs: [...this.logBuffer],
+        error: error instanceof Error ? error.message : String(error),
+      };
     } finally {
       await this.cleanup();
     }
@@ -1415,7 +1442,9 @@ export class DatabaseMigrator {
    */
   private log(message: string): void {
     const timestamp = new Date().toISOString();
-    console.log(`[${timestamp}] ${message}`);
+    const logMessage = `[${timestamp}] ${message}`;
+    console.log(logMessage);
+    this.logBuffer.push(logMessage);
   }
 
   /**
@@ -1426,6 +1455,7 @@ export class DatabaseMigrator {
     const errorMessage = `[${timestamp}] ❌ ${message}: ${error}`;
     console.error(errorMessage);
     this.stats.errors.push(errorMessage);
+    this.logBuffer.push(errorMessage);
   }
 
   /**
