@@ -11,6 +11,7 @@ import path from 'path';
 import fs from 'fs';
 import { DbTestLoaderMulti } from './db-test-loader-multi.js';
 import { DatabaseMigrator, parseDatabaseUrl } from './migration-core.js';
+import { DatabaseRollback } from './db-rollback.js';
 
 describe('Database Migration Integration Tests', () => {
   // Test database configuration
@@ -236,6 +237,131 @@ describe('Database Migration Integration Tests', () => {
 
     console.log('✅ Dry run mode test infrastructure verified');
   }, 30000);
+
+  it('should perform rollback after migration with altered data and verify restoration', async () => {
+    // This test simulates a realistic rollback scenario:
+    // 1. Perform migration (source has original data, dest has modified data, migration creates backup)
+    // 2. Make additional changes to destination data post-migration
+    // 3. Perform rollback to restore original state from backup
+    // 4. Verify that altered data is removed and original data is restored
+
+    // Verify initial state - source and dest have different data (like other tests)
+    const sourceLoader = multiLoader.getSourceLoader();
+    const destLoader = multiLoader.getDestLoader();
+
+    if (!sourceLoader || !destLoader) {
+      throw new Error('Test loaders not initialized');
+    }
+
+    // Load test data into both databases first (source gets original, dest gets modified)
+    await sourceLoader.loadTestData();
+    await destLoader.loadTestData();
+
+    console.log('🔄 Starting rollback test with altered data simulation...');
+
+    // Perform initial migration to create backup (this replaces dest modified data with source original data)
+    console.log('🚀 Starting initial migration to create backup...');
+    await migrator.migrate();
+    console.log('✅ Initial migration completed, backup created');
+
+    // Now alter data in destination to simulate changes after migration
+    console.log('📝 Altering destination data to simulate post-migration changes...');
+    await destLoader.executeQuery(`
+      UPDATE "User" SET name = name || ' ALTERED' WHERE id IN (1, 2)
+    `);
+    await destLoader.executeQuery(`
+      UPDATE "Post" SET title = 'MODIFIED_' || title WHERE id IN (101, 102)
+    `);
+    await destLoader.executeQuery(`
+      INSERT INTO "User" (id, email, name) VALUES (999, 'new@test.com', 'NEW_USER')
+    `);
+
+    // Verify the altered data exists
+    const alteredUsers = await destLoader.executeQuery(`
+      SELECT * FROM "User" WHERE name LIKE '% ALTERED' OR name = 'NEW_USER' ORDER BY id
+    `);
+    const alteredPosts = await destLoader.executeQuery(`
+      SELECT * FROM "Post" WHERE title LIKE 'MODIFIED_%' ORDER BY id
+    `);
+
+    expect(alteredUsers.length).toBeGreaterThan(0);
+    expect(alteredPosts.length).toBeGreaterThan(0);
+    console.log(
+      `📊 Found ${alteredUsers.length} altered users and ${alteredPosts.length} altered posts`
+    );
+
+    // Get available backups using DatabaseRollback
+    const destConfig = parseDatabaseUrl(expectedDestUrl);
+    const rollback = new DatabaseRollback(destConfig);
+
+    const availableBackups = await rollback.getAvailableBackups();
+    console.log(`📦 Found ${availableBackups.length} available backups`);
+    expect(availableBackups.length).toBeGreaterThan(0);
+
+    const latestBackup = availableBackups[0];
+    console.log(
+      `🔍 Using latest backup: ${latestBackup.timestamp} (${latestBackup.tableCount} tables)`
+    );
+
+    // Validate backup before rollback
+    const validation = await rollback.validateBackup(latestBackup.timestamp);
+    expect(validation.isValid).toBe(true);
+    console.log('✅ Backup validation passed');
+
+    // Perform rollback
+    console.log('🔄 Starting rollback operation...');
+    await rollback.rollback(latestBackup.timestamp);
+    console.log('✅ Rollback completed');
+
+    // Verify rollback restoration
+    console.log('🔍 Verifying rollback restoration...');
+
+    // Check that original data is restored (should be source data from simple_fixture.json)
+    const restoredUsers = await destLoader.executeQuery(`
+      SELECT * FROM "User" WHERE name NOT LIKE '% ALTERED' AND name != 'NEW_USER' ORDER BY id
+    `);
+    const restoredPosts = await destLoader.executeQuery(`
+      SELECT * FROM "Post" WHERE title NOT LIKE 'MODIFIED_%' ORDER BY id
+    `);
+
+    // Check that altered data is gone
+    const remainingAlteredUsers = await destLoader.executeQuery(`
+      SELECT * FROM "User" WHERE name LIKE '% ALTERED' OR name = 'NEW_USER'
+    `);
+    const remainingAlteredPosts = await destLoader.executeQuery(`
+      SELECT * FROM "Post" WHERE title LIKE 'MODIFIED_%'
+    `);
+
+    expect(remainingAlteredUsers.length).toBe(0);
+    expect(remainingAlteredPosts.length).toBe(0);
+    console.log('✅ Altered data successfully removed by rollback');
+
+    // Verify original data is restored correctly
+    expect(restoredUsers.length).toBeGreaterThan(0);
+    expect(restoredPosts.length).toBeGreaterThan(0);
+
+    // Check specific restored values from backup (should be the original destination modified data)
+    const originalUser1 = restoredUsers.find((u: any) => u.id === 1);
+    const originalUser2 = restoredUsers.find((u: any) => u.id === 2);
+
+    expect(originalUser1).toBeDefined();
+    expect(originalUser2).toBeDefined();
+    expect(originalUser1.name).toBe('John Doe Modified');
+    expect(originalUser2.name).toBe('Jane Smith Modified');
+
+    console.log('✅ Original backup data restored correctly');
+    console.log(`📊 Restored ${restoredUsers.length} users and ${restoredPosts.length} posts`);
+
+    // Verify backup was consumed (no longer available)
+    const backupsAfterRollback = await rollback.getAvailableBackups();
+    const consumedBackup = backupsAfterRollback.find(
+      (b: any) => b.timestamp === latestBackup.timestamp
+    );
+    expect(consumedBackup).toBeUndefined();
+    console.log('✅ Backup was consumed as expected');
+
+    await rollback.close();
+  }, 60000); // Increase timeout for rollback operations
 });
 
 describe('TES Schema Migration Integration Tests', () => {

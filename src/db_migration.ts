@@ -3,6 +3,7 @@
 import { Client } from 'pg';
 import { parseArgs } from 'node:util';
 import { DatabaseMigrator, parseDatabaseUrl, DatabaseConfig } from './migration-core.js';
+import { DatabaseRollback } from './db-rollback.js';
 import { fileURLToPath } from 'url';
 interface BackupInfo {
   timestamp: number;
@@ -28,10 +29,12 @@ interface ParsedArgs {
 class MigrationManager {
   private client: Client;
   private dryRun: boolean;
+  private rollbackManager: DatabaseRollback;
 
   constructor(config: DatabaseConfig, dryRun: boolean = false) {
     this.client = new Client(config);
     this.dryRun = dryRun;
+    this.rollbackManager = new DatabaseRollback(config);
   }
 
   private log(message: string): void {
@@ -73,62 +76,16 @@ class MigrationManager {
   }
 
   private async getAvailableBackups(): Promise<BackupInfo[]> {
-    const query = `
-      SELECT 
-        nspname as schema_name,
-        CASE 
-          WHEN nspname ~ '^backup_([0-9]+)$' 
-          THEN CAST(substring(nspname from '^backup_([0-9]+)$') AS BIGINT)
-          ELSE 0
-        END as timestamp
-      FROM pg_namespace 
-      WHERE nspname LIKE 'backup_%'
-        AND nspname ~ '^backup_[0-9]+$'
-      ORDER BY timestamp DESC;
-    `;
+    const rollbackBackups = await this.rollbackManager.getAvailableBackups();
 
-    const result = await this.client.query(query);
-    const backups: BackupInfo[] = [];
-
-    for (const row of result.rows) {
-      const timestamp = row.timestamp;
-      const schemaName = row.schema_name;
-      const created = new Date(timestamp);
-
-      // Get table count for this backup schema
-      const tableCountQuery = `
-        SELECT COUNT(*) as count 
-        FROM information_schema.tables 
-        WHERE table_schema = $1;
-      `;
-      const tableCountResult = await this.client.query(tableCountQuery, [schemaName]);
-      const tableCount = parseInt(tableCountResult.rows[0].count);
-
-      // Get approximate size
-      const sizeQuery = `
-        SELECT 
-          COALESCE(
-            pg_size_pretty(
-              SUM(pg_total_relation_size(schemaname||'.'||tablename))
-            ), 
-            '0 bytes'
-          ) as size
-        FROM pg_tables 
-        WHERE schemaname = $1;
-      `;
-      const sizeResult = await this.client.query(sizeQuery, [schemaName]);
-      const size = sizeResult.rows[0]?.size || '0 bytes';
-
-      backups.push({
-        timestamp,
-        schemaName,
-        created,
-        tableCount,
-        size,
-      });
-    }
-
-    return backups;
+    // Convert DatabaseRollback.BackupInfo to MigrationManager.BackupInfo
+    return rollbackBackups.map(backup => ({
+      timestamp: parseInt(backup.timestamp),
+      schemaName: backup.schemaName,
+      created: backup.createdAt,
+      tableCount: backup.tableCount,
+      size: backup.totalSize,
+    }));
   }
 
   private printBackupsTable(backups: BackupInfo[]): void {
@@ -153,157 +110,21 @@ class MigrationManager {
   }
 
   async rollback(timestamp: number | 'latest', keepTables: string[] = []): Promise<void> {
-    await this.connect();
-    try {
-      const backups = await this.getAvailableBackups();
+    const backups = await this.getAvailableBackups();
 
-      if (backups.length === 0) {
-        throw new Error('No backup schemas found');
-      }
-
-      const targetBackup =
-        timestamp === 'latest' ? backups[0] : backups.find(b => b.timestamp === timestamp);
-
-      if (!targetBackup) {
-        throw new Error(`Backup not found: ${timestamp}`);
-      }
-
-      await this.performRollback(targetBackup, keepTables);
-    } finally {
-      await this.disconnect();
-    }
-  }
-
-  private async performRollback(backup: BackupInfo, keepTables: string[]): Promise<void> {
-    this.log('\n⚠️  DESTRUCTIVE ROLLBACK - NO UNDO AVAILABLE');
-    this.log(`• Current 'public' schema → renamed to 'shadow' (temporary)`);
-    this.log(`• Backup '${backup.schemaName}' → renamed to 'public' (restored)`);
-    this.log(`• Existing 'shadow' schema will be DELETED if present`);
-
-    if (keepTables.length > 0) {
-      this.log(`\nCURRENT DATA TO BE KEPT:`);
-      this.log(`• Tables to copy from shadow to public: ${keepTables.join(', ')}`);
+    if (backups.length === 0) {
+      throw new Error('No backup schemas found');
     }
 
-    this.log(`\nBACKUP CONSUMED:`);
-    this.log(`• Backup '${backup.schemaName}' will be consumed (no longer available)`);
+    const targetBackup =
+      timestamp === 'latest' ? backups[0] : backups.find(b => b.timestamp === timestamp);
 
-    if (this.dryRun) {
-      this.log('\n🔍 DRY RUN - No changes made');
-      return;
+    if (!targetBackup) {
+      throw new Error(`Backup not found: ${timestamp}`);
     }
 
-    this.log('\n✅ Proceeding with destructive rollback...');
-
-    try {
-      // Disable foreign key constraints for rollback operations
-      this.log('🔓 Disabling foreign key constraints for rollback...');
-      await this.client.query('SET session_replication_role = replica;');
-
-      // Step 1: Clear existing shadow schema
-      await this.client.query('DROP SCHEMA IF EXISTS shadow CASCADE;');
-      this.log('• Cleared existing shadow schema');
-
-      // Step 2: Rename current public to shadow
-      await this.client.query('ALTER SCHEMA public RENAME TO shadow;');
-      this.log('• Renamed current public schema to shadow');
-
-      // Step 3: Rename backup to public
-      await this.client.query(`ALTER SCHEMA ${backup.schemaName} RENAME TO public;`);
-      this.log(`• Renamed backup schema to public`);
-
-      // Step 4: Handle keep-tables if specified
-      if (keepTables.length > 0) {
-        await this.copyKeepTables(keepTables);
-      }
-
-      // Step 5: Re-enable foreign key constraints
-      this.log('🔒 Re-enabling foreign key constraints...');
-      await this.client.query('SET session_replication_role = origin;');
-
-      // Step 6: Cleanup shadow schema
-      await this.client.query('DROP SCHEMA shadow CASCADE;');
-      this.log('• Cleaned up shadow schema');
-
-      this.log('\n✅ Rollback completed successfully!');
-      this.log(`📦 Backup '${backup.schemaName}' has been consumed`);
-    } catch (error) {
-      this.log('\n❌ Rollback failed, attempting to restore original state...');
-
-      // Ensure foreign key constraints are re-enabled even on failure
-      try {
-        this.log('🔒 Re-enabling foreign key constraints after rollback error...');
-        await this.client.query('SET session_replication_role = origin;');
-      } catch (fkError) {
-        this.log(`⚠️  Warning: Could not re-enable foreign key constraints: ${fkError}`);
-      }
-
-      await this.recoverFromFailedRollback();
-      throw error;
-    }
-  }
-
-  private async copyKeepTables(keepTables: string[]): Promise<void> {
-    this.log('\n🔄 Copying preserved tables from shadow to public...');
-
-    for (const tableName of keepTables) {
-      try {
-        // Check if table exists in shadow
-        const checkQuery = `
-          SELECT EXISTS (
-            SELECT 1 FROM information_schema.tables 
-            WHERE table_schema = 'shadow' AND table_name = $1
-          );
-        `;
-        const checkResult = await this.client.query(checkQuery, [tableName]);
-
-        if (!checkResult.rows[0].exists) {
-          this.log(`⚠️  Table '${tableName}' not found in shadow schema, skipping`);
-          continue;
-        }
-
-        // Drop table in public if it exists
-        await this.client.query(`DROP TABLE IF EXISTS public."${tableName}" CASCADE;`);
-
-        // Create table structure from shadow
-        await this.client.query(
-          `CREATE TABLE public."${tableName}" (LIKE shadow."${tableName}" INCLUDING ALL);`
-        );
-
-        // Copy data
-        await this.client.query(
-          `INSERT INTO public.${tableName} SELECT * FROM shadow.${tableName};`
-        );
-
-        this.log(`  ✓ Copied table '${tableName}' from shadow to public`);
-      } catch (error) {
-        this.log(`  ❌ Failed to copy table '${tableName}': ${error}`);
-        throw error;
-      }
-    }
-  }
-
-  private async recoverFromFailedRollback(): Promise<void> {
-    try {
-      // Check if shadow schema exists
-      const shadowCheck = await this.client.query(`
-        SELECT EXISTS (
-          SELECT 1 FROM information_schema.schemata 
-          WHERE schema_name = 'shadow'
-        );
-      `);
-
-      if (shadowCheck.rows[0].exists) {
-        // Restore shadow to public
-        await this.client.query('DROP SCHEMA IF EXISTS public CASCADE;');
-        await this.client.query('ALTER SCHEMA shadow RENAME TO public;');
-        this.log('✅ Original state restored from shadow');
-      } else {
-        this.log('❌ Cannot recover: shadow schema not found');
-      }
-    } catch (recoverError) {
-      this.log(`❌ Recovery failed: ${recoverError}`);
-    }
+    // Use DatabaseRollback for the actual rollback operation
+    await this.rollbackManager.rollback(targetBackup.timestamp.toString(), keepTables);
   }
 
   async cleanup(beforeDate: string): Promise<void> {
