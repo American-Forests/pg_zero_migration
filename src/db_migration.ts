@@ -472,8 +472,13 @@ async function handleStartCommand(values: ParsedArgs, dryRun: boolean): Promise<
     writeLogFile(result, sourceConfig, destConfig);
 
     if (result.success) {
-      console.log('\n✅ Migration completed successfully!');
-      console.log('📦 Schema backup retained for rollback purposes');
+      if (dryRun) {
+        console.log('\n✅ Dry run completed successfully!');
+        console.log('💡 Review the analysis above and run without --dry-run when ready');
+      } else {
+        console.log('\n✅ Migration completed successfully!');
+        console.log('📦 Schema backup retained for rollback purposes');
+      }
       process.exit(0);
     } else {
       console.error('\n❌ Migration failed:', result.error);

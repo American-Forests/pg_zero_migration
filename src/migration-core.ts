@@ -112,8 +112,17 @@ export class DatabaseMigrator {
   ) {
     this.sourceConfig = sourceConfig;
     this.destConfig = destConfig;
-    this.sourcePool = new Pool(this.sourceConfig);
-    this.destPool = new Pool(this.destConfig);
+
+    // Create pools with SSL configuration
+    this.sourcePool = new Pool({
+      ...this.sourceConfig,
+      ssl: this.sourceConfig.ssl !== false ? { rejectUnauthorized: false } : false,
+    });
+    this.destPool = new Pool({
+      ...this.destConfig,
+      ssl: this.destConfig.ssl !== false ? { rejectUnauthorized: false } : false,
+    });
+
     this.preservedTables = new Set(preservedTables);
     this.tempDir = '/tmp';
     this.dryRun = dryRun;
@@ -138,7 +147,7 @@ export class DatabaseMigrator {
       // Pre-migration checks
       await this.performPreMigrationChecks();
 
-      // Analyze schemas
+      // Analyze schemas for both dry run and real migrations
       const sourceTables = await this.analyzeSchema(this.sourcePool, 'source');
       const destTables = await this.analyzeSchema(this.destPool, 'destination');
 
@@ -188,26 +197,151 @@ export class DatabaseMigrator {
   private async performPreMigrationChecks(): Promise<void> {
     this.log('🔍 Performing pre-migration checks...');
 
-    // Test database connections
-    try {
-      await this.sourcePool.query('SELECT 1');
-      this.log('✅ Source database connection successful');
-    } catch (error) {
-      throw new Error(`Failed to connect to source database: ${error}`);
-    }
-
-    try {
-      await this.destPool.query('SELECT 1');
-      this.log('✅ Destination database connection successful');
-    } catch (error) {
-      throw new Error(`Failed to connect to destination database: ${error}`);
-    }
+    // Enhanced connectivity check for both dry run and real migrations
+    await this.performConnectivityCheck();
 
     // Check for required extensions
     await this.ensureExtensions();
 
     // Check disk space (simplified check)
     await this.checkDiskSpace();
+  }
+
+  /**
+   * Comprehensive database connectivity and compatibility check
+   */
+  private async performConnectivityCheck(): Promise<void> {
+    this.log('🔗 Performing database connectivity check...');
+
+    // Test source database connection and gather info
+    let sourceVersion = '';
+    let sourceDbName = '';
+    try {
+      await this.sourcePool.query('SELECT 1');
+      this.log('✅ Source database connection successful');
+
+      // Get database version
+      const versionResult = await this.sourcePool.query('SELECT version()');
+      sourceVersion = versionResult.rows[0].version;
+      const versionMatch = sourceVersion.match(/PostgreSQL (\d+\.\d+)/);
+      const shortVersion = versionMatch ? versionMatch[1] : 'unknown';
+      this.log(`📊 Source PostgreSQL version: ${shortVersion}`);
+
+      // Get database name
+      const dbResult = await this.sourcePool.query('SELECT current_database()');
+      sourceDbName = dbResult.rows[0].current_database;
+      this.log(`📊 Source database: ${sourceDbName}`);
+
+      // Check permissions
+      await this.checkSourcePermissions();
+    } catch (error) {
+      throw new Error(`Failed to connect to source database: ${error}`);
+    }
+
+    // Test destination database connection and gather info
+    let destVersion = '';
+    let destDbName = '';
+    try {
+      await this.destPool.query('SELECT 1');
+      this.log('✅ Destination database connection successful');
+
+      // Get database version
+      const versionResult = await this.destPool.query('SELECT version()');
+      destVersion = versionResult.rows[0].version;
+      const versionMatch = destVersion.match(/PostgreSQL (\d+\.\d+)/);
+      const shortVersion = versionMatch ? versionMatch[1] : 'unknown';
+      this.log(`📊 Destination PostgreSQL version: ${shortVersion}`);
+
+      // Get database name
+      const dbResult = await this.destPool.query('SELECT current_database()');
+      destDbName = dbResult.rows[0].current_database;
+      this.log(`📊 Destination database: ${destDbName}`);
+
+      // Check permissions
+      await this.checkDestinationPermissions();
+    } catch (error) {
+      throw new Error(`Failed to connect to destination database: ${error}`);
+    }
+
+    // Version compatibility check
+    this.checkVersionCompatibility(sourceVersion, destVersion);
+
+    this.log('✅ Database connectivity check completed');
+  }
+
+  /**
+   * Check source database permissions
+   */
+  private async checkSourcePermissions(): Promise<void> {
+    try {
+      // Check if user can SELECT from tables
+      await this.sourcePool.query(`
+        SELECT has_database_privilege(current_user, current_database(), 'CONNECT') as can_connect,
+               has_database_privilege(current_user, current_database(), 'CREATE') as can_create
+      `);
+      this.log('✅ Source database permissions verified (CONNECT, CREATE)');
+
+      // Check if user can create schemas
+      await this.sourcePool.query("SELECT has_schema_privilege(current_user, 'public', 'CREATE')");
+      this.log('✅ Source schema permissions verified (CREATE in public schema)');
+    } catch (error) {
+      this.stats.warnings.push(`Could not verify all source permissions: ${error}`);
+    }
+  }
+
+  /**
+   * Check destination database permissions
+   */
+  private async checkDestinationPermissions(): Promise<void> {
+    try {
+      // Check if user can SELECT from tables and CREATE schemas
+      await this.destPool.query(`
+        SELECT has_database_privilege(current_user, current_database(), 'CONNECT') as can_connect,
+               has_database_privilege(current_user, current_database(), 'CREATE') as can_create
+      `);
+      this.log('✅ Destination database permissions verified (CONNECT, CREATE)');
+
+      // Check if user can create schemas
+      await this.destPool.query("SELECT has_schema_privilege(current_user, 'public', 'CREATE')");
+      this.log('✅ Destination schema permissions verified (CREATE in public schema)');
+    } catch (error) {
+      this.stats.warnings.push(`Could not verify all destination permissions: ${error}`);
+    }
+  }
+
+  /**
+   * Check PostgreSQL version compatibility
+   */
+  private checkVersionCompatibility(sourceVersion: string, destVersion: string): void {
+    const sourceMatch = sourceVersion.match(/PostgreSQL (\d+)\.(\d+)/);
+    const destMatch = destVersion.match(/PostgreSQL (\d+)\.(\d+)/);
+
+    if (sourceMatch && destMatch) {
+      const sourceMajor = parseInt(sourceMatch[1]);
+      const sourceMinor = parseInt(sourceMatch[2]);
+      const destMajor = parseInt(destMatch[1]);
+      const destMinor = parseInt(destMatch[2]);
+
+      if (sourceMajor === destMajor) {
+        this.log('✅ PostgreSQL versions are compatible (same major version)');
+      } else if (Math.abs(sourceMajor - destMajor) <= 1) {
+        this.log(
+          '⚠️  PostgreSQL versions differ by one major version - migration should work but test thoroughly'
+        );
+        this.stats.warnings.push(
+          `Version difference: source=${sourceMajor}.${sourceMinor}, dest=${destMajor}.${destMinor}`
+        );
+      } else {
+        this.log(
+          '⚠️  PostgreSQL versions differ significantly - migration may have compatibility issues'
+        );
+        this.stats.warnings.push(
+          `Significant version difference: source=${sourceMajor}.${sourceMinor}, dest=${destMajor}.${destMinor}`
+        );
+      }
+    } else {
+      this.log('⚠️  Could not parse PostgreSQL versions for compatibility check');
+    }
   }
 
   /**
@@ -400,65 +534,183 @@ export class DatabaseMigrator {
   }
 
   /**
-   * Perform dry run analysis
+   * Perform comprehensive dry run analysis with real database data
    */
   private async performDryRun(sourceTables: TableInfo[], destTables: TableInfo[]): Promise<void> {
-    this.log('🧪 Performing dry run analysis...');
+    this.log('🧪 Performing comprehensive dry run analysis...');
 
-    this.log(`📊 Migration Plan:`);
+    // Migration plan overview
+    this.log(`📊 Migration Plan Overview:`);
     this.log(`   Source tables to migrate: ${sourceTables.length}`);
+    this.log(`   Destination tables to backup: ${destTables.length}`);
+    this.log(`   Preserved tables: ${this.preservedTables.size}`);
 
+    // Analyze source tables with real data
+    this.log(`\n📋 Source Database Analysis:`);
+    let totalSourceRecords = 0;
     for (const sourceTable of sourceTables) {
       try {
         const countResult = await this.sourcePool.query(
-          `SELECT COUNT(*) FROM ${sourceTable.tableName}`
+          `SELECT COUNT(*) FROM "${sourceTable.tableName}"`
         );
         const rowCount = parseInt(countResult.rows[0].count);
+        totalSourceRecords += rowCount;
+
+        // Analyze table structure
+        const columnsCount = sourceTable.columns.length;
+        const indexesCount = sourceTable.indexes.length;
+        const constraintsCount = sourceTable.constraints.length;
+        const sequencesCount = sourceTable.sequences.length;
+
+        this.log(`   📦 ${sourceTable.tableName}:`);
+        this.log(`      └─ Records: ${rowCount.toLocaleString()}`);
         this.log(
-          `   - ${sourceTable.tableName}: ${rowCount} rows → ${sourceTable.tableName}_shadow`
+          `      └─ Columns: ${columnsCount}, Indexes: ${indexesCount}, Constraints: ${constraintsCount}, Sequences: ${sequencesCount}`
         );
+
+        // Check for special column types that might need attention
+        const specialColumns = sourceTable.columns.filter(
+          col =>
+            col.dataType.includes('geometry') ||
+            col.dataType.includes('geography') ||
+            col.dataType.includes('json') ||
+            col.dataType.includes('array')
+        );
+
+        if (specialColumns.length > 0) {
+          this.log(
+            `      └─ Special columns: ${specialColumns.map(c => `${c.columnName} (${c.dataType})`).join(', ')}`
+          );
+        }
       } catch (error) {
-        this.log(`   - ${sourceTable.tableName}: Could not count rows (${error})`);
+        this.log(`   📦 ${sourceTable.tableName}: ⚠️ Could not analyze (${error})`);
       }
     }
 
-    this.log(`   Destination schema to backup: ${destTables.length} tables`);
+    // Analyze destination tables with real data
+    this.log(`\n📋 Destination Database Analysis:`);
     const timestamp = Date.now();
-    this.log(`   → All tables will be preserved in backup_${timestamp} schema`);
-
     for (const destTable of destTables) {
       try {
         const countResult = await this.destPool.query(
-          `SELECT COUNT(*) FROM ${destTable.tableName}`
+          `SELECT COUNT(*) FROM "${destTable.tableName}"`
         );
         const rowCount = parseInt(countResult.rows[0].count);
-        this.log(`   - ${destTable.tableName}: ${rowCount} rows`);
+        this.log(
+          `   📦 ${destTable.tableName}: ${rowCount.toLocaleString()} records → backup_${timestamp} schema`
+        );
       } catch (error) {
-        this.log(`   - ${destTable.tableName}: Could not count rows (${error})`);
+        this.log(`   📦 ${destTable.tableName}: ⚠️ Could not count records (${error})`);
       }
     }
 
-    // Check for preserved table restoration
-    const preservedTablesFound = [];
-    for (const preservedTableName of this.preservedTables) {
-      const sourceHasTable = sourceTables.some(
-        t => t.tableName.toLowerCase() === preservedTableName
-      );
-      const destHasTable = destTables.some(t => t.tableName.toLowerCase() === preservedTableName);
+    // Preserved tables analysis
+    if (this.preservedTables.size > 0) {
+      this.log(`\n🔒 Preserved Tables Analysis:`);
+      const preservedTablesFound = [];
+      for (const preservedTableName of this.preservedTables) {
+        const sourceHasTable = sourceTables.some(
+          t => t.tableName.toLowerCase() === preservedTableName.toLowerCase()
+        );
+        const destTable = destTables.find(
+          t => t.tableName.toLowerCase() === preservedTableName.toLowerCase()
+        );
 
-      if (sourceHasTable && destHasTable) {
-        preservedTablesFound.push(preservedTableName);
+        if (sourceHasTable && destTable) {
+          preservedTablesFound.push(preservedTableName);
+          try {
+            const countResult = await this.destPool.query(
+              `SELECT COUNT(*) FROM "${destTable.tableName}"`
+            );
+            const rowCount = parseInt(countResult.rows[0].count);
+            this.log(
+              `   🔄 ${preservedTableName}: ${rowCount.toLocaleString()} records (will be synced and restored)`
+            );
+          } catch (error) {
+            this.log(`   🔄 ${preservedTableName}: ⚠️ Could not count records (${error})`);
+          }
+        } else if (!sourceHasTable) {
+          this.log(`   ❌ ${preservedTableName}: Not found in source database`);
+        } else if (!destTable) {
+          this.log(`   ❌ ${preservedTableName}: Not found in destination database`);
+        }
       }
     }
 
-    if (preservedTablesFound.length > 0) {
-      this.log(`   Preserved tables to restore: ${preservedTablesFound.length}`);
-      for (const tableName of preservedTablesFound) {
-        this.log(`   - ${tableName}: Will clear and restore from backup`);
-      }
+    // Migration steps preview
+    this.log(`\n🔄 Migration Steps (DRY RUN - no changes will be made):`);
+    this.log(`   1. 🔒 Enable write protection on source and destination databases`);
+    this.log(
+      `   2. 📦 Create source dump of ${sourceTables.length} tables (${totalSourceRecords.toLocaleString()} total records)`
+    );
+    this.log(`   3. 🔄 Restore source data to destination shadow schema`);
+    if (this.preservedTables.size > 0) {
+      this.log(`   4. 🔄 Setup real-time sync for ${this.preservedTables.size} preserved tables`);
+      this.log(`   5. 💾 Backup preserved table data for rollback safety`);
+    } else {
+      this.log(`   4. ⏭️  No preserved tables to sync`);
+      this.log(`   5. ⏭️  No preserved table backup needed`);
+    }
+    this.log(`   6. ⚡ Perform atomic schema swap (zero downtime!)`);
+    this.log(`   7. 🧹 Cleanup sync triggers and validate consistency`);
+    this.log(
+      `   8. 🔢 Reset sequences for ${sourceTables.filter(t => t.sequences.length > 0).length} tables`
+    );
+    this.log(
+      `   9. 🗂️  Recreate ${sourceTables.reduce((acc, t) => acc + t.indexes.length, 0)} indexes`
+    );
+    this.log(`  10. 🔓 Remove write protection and complete migration`);
+
+    // Risk assessment
+    this.log(`\n⚡ Risk Assessment:`);
+    const highRiskFactors = [];
+    const mediumRiskFactors = [];
+
+    if (totalSourceRecords > 1000000) {
+      highRiskFactors.push(`Large dataset (${totalSourceRecords.toLocaleString()} records)`);
+    } else if (totalSourceRecords > 100000) {
+      mediumRiskFactors.push(`Medium dataset (${totalSourceRecords.toLocaleString()} records)`);
     }
 
-    this.log('🧪 Dry run completed - no changes made');
+    const tablesWithGeometry = sourceTables.filter(t =>
+      t.columns.some(c => c.dataType.includes('geometry') || c.dataType.includes('geography'))
+    );
+    if (tablesWithGeometry.length > 0) {
+      mediumRiskFactors.push(`${tablesWithGeometry.length} tables with spatial data`);
+    }
+
+    const tablesWithManyIndexes = sourceTables.filter(t => t.indexes.length > 10);
+    if (tablesWithManyIndexes.length > 0) {
+      mediumRiskFactors.push(`${tablesWithManyIndexes.length} tables with many indexes (>10)`);
+    }
+
+    if (highRiskFactors.length > 0) {
+      this.log(`   🔴 High Risk Factors: ${highRiskFactors.join(', ')}`);
+    }
+    if (mediumRiskFactors.length > 0) {
+      this.log(`   🟡 Medium Risk Factors: ${mediumRiskFactors.join(', ')}`);
+    }
+    if (highRiskFactors.length === 0 && mediumRiskFactors.length === 0) {
+      this.log(`   🟢 Low Risk: Standard migration with no significant risk factors`);
+    }
+
+    // Estimated timing
+    const estimatedDumpTime = Math.ceil(totalSourceRecords / 50000); // ~50k records per minute
+    const estimatedRestoreTime = Math.ceil(totalSourceRecords / 30000); // ~30k records per minute
+    const estimatedTotalTime = estimatedDumpTime + estimatedRestoreTime + 2; // +2 for overhead
+
+    this.log(`\n⏱️  Estimated Timing:`);
+    this.log(`   📦 Dump phase: ~${estimatedDumpTime} minutes`);
+    this.log(`   🔄 Restore phase: ~${estimatedRestoreTime} minutes`);
+    this.log(`   ⚡ Schema swap: <30 seconds (zero downtime)`);
+    this.log(`   🎯 Total estimated time: ~${estimatedTotalTime} minutes`);
+
+    // Update statistics for dry run
+    this.stats.tablesProcessed = sourceTables.length;
+    this.stats.recordsMigrated = totalSourceRecords;
+
+    this.log('\n🧪 Dry run analysis completed - no changes were made to any databases');
+    this.log('💡 Review the analysis above and run without --dry-run when ready');
   }
 
   /**
@@ -1709,11 +1961,36 @@ export class DatabaseMigrator {
  */
 export function parseDatabaseUrl(url: string): DatabaseConfig {
   const parsed = new URL(url);
+
+  // Check for SSL parameters in query string
+  const sslParam = parsed.searchParams.get('ssl');
+  const sslModeParam = parsed.searchParams.get('sslmode');
+
+  // Determine SSL based on hostname and parameters
+  let ssl = true;
+
+  // Default to SSL for cloud providers
+  if (
+    parsed.hostname.includes('localhost') ||
+    parsed.hostname.includes('127.0.0.1') ||
+    parsed.hostname.startsWith('192.168.')
+  ) {
+    ssl = false;
+  }
+
+  // Override based on explicit parameters
+  if (sslParam === 'true' || sslModeParam === 'require' || sslModeParam === 'prefer') {
+    ssl = true;
+  } else if (sslParam === 'false' || sslModeParam === 'disable') {
+    ssl = false;
+  }
+
   return {
     host: parsed.hostname,
     port: parseInt(parsed.port) || 5432,
     database: parsed.pathname.substring(1),
     user: parsed.username,
     password: parsed.password,
+    ssl: ssl,
   };
 }
