@@ -260,9 +260,6 @@ export class DatabaseRollback {
         result.tableValidations.push(validation);
       }
 
-      // Enhanced validation: Referential integrity check (optimized)
-      await this.validateBackupReferentialIntegrity(client, schemaName, result);
-
       // Check for critical tables
       const criticalTables = ['User', 'user']; // Add more as needed
       const backupTableNames = result.tableValidations.map(v => v.tableName.toLowerCase());
@@ -395,81 +392,6 @@ export class DatabaseRollback {
     } catch (error) {
       // Non-critical error - log as warning but don't fail validation
       validation.errors.push(`Data integrity check warning: ${error}`);
-    }
-  }
-
-  /**
-   * Validate referential integrity in backup schema
-   * Validates all foreign keys for comprehensive integrity checking
-   */
-  private async validateBackupReferentialIntegrity(
-    client: PoolClient,
-    schemaName: string,
-    result: BackupValidationResult
-  ): Promise<void> {
-    try {
-      this.log('🔗 Validating backup referential integrity...');
-
-      // Get all foreign key constraints
-      const foreignKeys = await client.query(
-        `
-        SELECT 
-          tc.table_name,
-          tc.constraint_name,
-          kcu.column_name,
-          ccu.table_name AS foreign_table_name,
-          ccu.column_name AS foreign_column_name
-        FROM information_schema.table_constraints AS tc 
-        JOIN information_schema.key_column_usage AS kcu 
-          ON tc.constraint_name = kcu.constraint_name
-        JOIN information_schema.constraint_column_usage AS ccu 
-          ON ccu.constraint_name = tc.constraint_name
-        WHERE tc.constraint_type = 'FOREIGN KEY' 
-          AND tc.table_schema = $1
-      `,
-        [schemaName]
-      );
-
-      let violationCount = 0;
-
-      for (const fk of foreignKeys.rows) {
-        try {
-          // Performance optimized: Use LIMIT 1 to just check if violations exist
-          const orphanCheck = await client.query(`
-            SELECT 1
-            FROM "${schemaName}"."${fk.table_name}" t
-            WHERE "${fk.column_name}" IS NOT NULL
-            AND NOT EXISTS (
-              SELECT 1 FROM "${schemaName}"."${fk.foreign_table_name}" f
-              WHERE f."${fk.foreign_column_name}" = t."${fk.column_name}"
-            )
-            LIMIT 1
-          `);
-
-          if (orphanCheck.rows.length > 0) {
-            violationCount++;
-            result.warnings.push(
-              `Referential integrity: Orphaned records found in ${fk.table_name}.${fk.column_name}`
-            );
-          }
-        } catch (error) {
-          result.warnings.push(
-            `Referential integrity check warning for ${fk.constraint_name}: ${error}`
-          );
-        }
-      }
-
-      if (violationCount > 0) {
-        result.warnings.push(
-          `Backup referential integrity: Found violations in ${violationCount} constraints (non-blocking)`
-        );
-      }
-
-      this.log(
-        `✅ Backup referential integrity validated (${foreignKeys.rows.length} constraints checked)`
-      );
-    } catch (error) {
-      result.warnings.push(`Backup referential integrity validation warning: ${error}`);
     }
   }
 

@@ -10,6 +10,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import path from 'path';
 import fs from 'fs';
 import { DbTestLoaderMulti } from './test-loader-multi.js';
+import { DbTestLoader } from './test-loader.js';
 import { DatabaseMigrator, parseDatabaseUrl } from '../migration-core.js';
 import { DatabaseRollback } from '../rollback.js';
 
@@ -118,8 +119,12 @@ describe('Database Migration Integration Tests', () => {
 
   it('should perform complete migration and verify data integrity', async () => {
     // Verify initial state - source and dest have different data
-    const sourceLoader = multiLoader.getSourceLoader()!;
-    const destLoader = multiLoader.getDestLoader()!;
+    const sourceLoader = multiLoader.getSourceLoader();
+    const destLoader = multiLoader.getDestLoader();
+
+    if (!sourceLoader || !destLoader) {
+      throw new Error('Test loaders not initialized');
+    }
 
     // Load test data into both databases first
     await sourceLoader.loadTestData();
@@ -219,15 +224,80 @@ describe('Database Migration Integration Tests', () => {
     expect(backupSchemaCheck.length).toBeGreaterThan(0);
     expect(backupSchemaCheck[0].schema_name).toMatch(/^backup_\d+$/);
 
+    // ✅ HIGH PRIORITY VALIDATION: Foreign Key Integrity Check (moved from migration-core.ts validateForeignKeyIntegrity)
+    // This was previously performed during migration runtime, causing performance delays
+    console.log('🔗 Validating foreign key integrity post-migration...');
+
+    async function validateForeignKeyIntegrity(
+      loader: DbTestLoader,
+      dbName: string
+    ): Promise<void> {
+      // Get all foreign key constraints
+      const foreignKeys = await loader.executeQuery(`
+        SELECT 
+          tc.table_name,
+          tc.constraint_name,
+          kcu.column_name,
+          ccu.table_name AS foreign_table_name,
+          ccu.column_name AS foreign_column_name
+        FROM information_schema.table_constraints AS tc 
+        JOIN information_schema.key_column_usage AS kcu 
+          ON tc.constraint_name = kcu.constraint_name
+        JOIN information_schema.constraint_column_usage AS ccu 
+          ON ccu.constraint_name = tc.constraint_name
+        WHERE tc.constraint_type = 'FOREIGN KEY' 
+          AND tc.table_schema = 'public'
+      `);
+
+      let violationCount = 0;
+      for (const fk of foreignKeys) {
+        try {
+          // Check for orphaned records - this expensive operation is now in tests, not migration
+          const orphanCheck = await loader.executeQuery(`
+            SELECT COUNT(*) as orphan_count
+            FROM "${fk.table_name}" t
+            WHERE "${fk.column_name}" IS NOT NULL
+            AND NOT EXISTS (
+              SELECT 1 FROM "${fk.foreign_table_name}" f
+              WHERE f."${fk.foreign_column_name}" = t."${fk.column_name}"
+            )
+          `);
+
+          const orphanCount = parseInt(orphanCheck[0].orphan_count);
+          if (orphanCount > 0) {
+            violationCount++;
+            console.error(
+              `FK violation: ${fk.table_name}.${fk.column_name} has ${orphanCount} orphaned records`
+            );
+          }
+        } catch (error) {
+          console.warn(`Could not validate FK ${fk.constraint_name}: ${error}`);
+        }
+      }
+
+      expect(violationCount).toBe(0);
+      console.log(
+        `✅ ${dbName} FK integrity validated (${foreignKeys.length} constraints checked)`
+      );
+    }
+
+    // Validate both source and destination databases
+    await validateForeignKeyIntegrity(sourceLoader, 'source');
+    await validateForeignKeyIntegrity(destLoader, 'destination');
+
     console.log('✅ Source database schema restoration verified');
     console.log('✅ Backup schema creation verified');
+    console.log('✅ Foreign key integrity validation completed');
     console.log('✅ Complete migration and data verification successful');
   }, 60000);
 
   it('should handle migration with dry run mode', async () => {
     console.log('⚠️  Skipping migration test due to pg_dump version mismatch');
 
-    const destLoader = multiLoader.getDestLoader()!;
+    const destLoader = multiLoader.getDestLoader();
+    if (!destLoader) {
+      throw new Error('Destination loader not initialized');
+    }
     await destLoader.loadTestData();
 
     // Get initial destination data (should be modified)
@@ -235,6 +305,51 @@ describe('Database Migration Integration Tests', () => {
     expect(destUsersBeforeDryRun).toHaveLength(2);
     expect(destUsersBeforeDryRun[0].name).toBe('John Doe Modified');
 
+    // ✅ HIGH PRIORITY VALIDATION: Database Consistency Check (moved from migration-core.ts validateDatabaseConsistency)
+    // This was previously performed during migration preparation, causing startup delays
+    console.log('🔬 Validating database consistency (moved from pre-migration checks)...');
+
+    async function validateDatabaseConsistency(
+      loader: DbTestLoader,
+      dbName: string
+    ): Promise<void> {
+      // Check for potentially unused indexes
+      const unusedIndexes = await loader.executeQuery(`
+        SELECT COUNT(*) as unused_count
+        FROM pg_stat_user_indexes 
+        WHERE idx_scan = 0 AND idx_tup_read > 0
+      `);
+
+      const unusedCount = parseInt(unusedIndexes[0].unused_count);
+      console.log(`${dbName}: Found ${unusedCount} potentially unused indexes`);
+
+      // Check for unvalidated foreign key constraints
+      const constraintViolations = await loader.executeQuery(`
+        SELECT COUNT(*) as violation_count
+        FROM pg_constraint c
+        JOIN pg_class t ON c.conrelid = t.oid
+        JOIN pg_namespace n ON t.relnamespace = n.oid
+        WHERE n.nspname = 'public' 
+        AND c.contype = 'f'
+        AND NOT c.convalidated
+      `);
+
+      const violationCount = parseInt(constraintViolations[0].violation_count);
+      expect(violationCount).toBe(0);
+      console.log(`✅ ${dbName} database consistency validated`);
+    }
+
+    const sourceLoader = multiLoader.getSourceLoader();
+    if (!sourceLoader) {
+      throw new Error('Source loader not initialized');
+    }
+    await sourceLoader.loadTestData();
+
+    // Validate both databases - this type of check should happen in tests, not during migration
+    await validateDatabaseConsistency(sourceLoader, 'source');
+    await validateDatabaseConsistency(destLoader, 'destination');
+
+    console.log('✅ Database consistency validation completed');
     console.log('✅ Dry run mode test infrastructure verified');
   }, 30000);
 
@@ -307,6 +422,72 @@ describe('Database Migration Integration Tests', () => {
     const validation = await rollback.validateBackup(latestBackup.timestamp);
     expect(validation.isValid).toBe(true);
     console.log('✅ Backup validation passed');
+
+    // ✅ HIGH PRIORITY VALIDATION: Backup Referential Integrity Check (moved from rollback.ts validateBackupReferentialIntegrity)
+    // This was previously performed during rollback operations, causing delays in recovery
+    console.log('🔗 Validating backup referential integrity (moved from rollback operations)...');
+
+    async function validateBackupReferentialIntegrity(
+      loader: DbTestLoader,
+      schemaName: string
+    ): Promise<void> {
+      // Get all foreign key constraints in backup schema
+      const foreignKeys = await loader.executeQuery(
+        `
+        SELECT 
+          tc.table_name,
+          tc.constraint_name,
+          kcu.column_name,
+          ccu.table_name AS foreign_table_name,
+          ccu.column_name AS foreign_column_name
+        FROM information_schema.table_constraints AS tc 
+        JOIN information_schema.key_column_usage AS kcu 
+          ON tc.constraint_name = kcu.constraint_name
+        JOIN information_schema.constraint_column_usage AS ccu 
+          ON ccu.constraint_name = tc.constraint_name
+        WHERE tc.constraint_type = 'FOREIGN KEY' 
+          AND tc.table_schema = $1
+      `,
+        [schemaName]
+      );
+
+      let violationCount = 0;
+      for (const fk of foreignKeys) {
+        try {
+          // Check for orphaned records in backup schema - expensive operation now in tests
+          const orphanCheck = await loader.executeQuery(`
+            SELECT COUNT(*) as orphan_count
+            FROM "${schemaName}"."${fk.table_name}" t
+            WHERE "${fk.column_name}" IS NOT NULL
+            AND NOT EXISTS (
+              SELECT 1 FROM "${schemaName}"."${fk.foreign_table_name}" f
+              WHERE f."${fk.foreign_column_name}" = t."${fk.column_name}"
+            )
+          `);
+
+          const orphanCount = parseInt(orphanCheck[0].orphan_count);
+          if (orphanCount > 0) {
+            violationCount++;
+            console.error(
+              `Backup referential integrity violation: ${fk.table_name}.${fk.column_name} has ${orphanCount} orphaned records`
+            );
+          }
+        } catch (error) {
+          console.warn(
+            `Backup referential integrity check warning for ${fk.constraint_name}: ${error}`
+          );
+        }
+      }
+
+      expect(violationCount).toBe(0);
+      console.log(
+        `✅ Backup referential integrity validated (${foreignKeys.length} constraints checked)`
+      );
+    }
+
+    // Validate the backup schema referential integrity
+    const backupSchemaName = `backup_${latestBackup.timestamp}`;
+    await validateBackupReferentialIntegrity(destLoader, backupSchemaName);
 
     // Perform rollback
     console.log('🔄 Starting rollback operation...');
@@ -590,8 +771,12 @@ describe('TES Schema Migration Integration Tests', () => {
 
   it('should perform TES schema migration with PostGIS data and verify integrity', async () => {
     // Verify initial state - source and dest have different TES data
-    const sourceLoader = multiLoader.getSourceLoader()!;
-    const destLoader = multiLoader.getDestLoader()!;
+    const sourceLoader = multiLoader.getSourceLoader();
+    const destLoader = multiLoader.getDestLoader();
+
+    if (!sourceLoader || !destLoader) {
+      throw new Error('Test loaders not initialized');
+    }
 
     // Load test data into both databases first
     await sourceLoader.loadTestData();
