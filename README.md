@@ -59,6 +59,50 @@ The migration process follows a carefully orchestrated 8-phase approach:
 2. **Spatial Index Handling**: Special handling for PostGIS spatial indexes
 3. **Constraint Re-enabling**: Restores foreign key constraints
 
+## Destination Database Protection
+
+The migration tool implements multiple layers of protection to prevent overwhelming the destination database during restore operations:
+
+### Shadow Schema Isolation
+
+- **Parallel Operations**: Data restore happens in an isolated `shadow` schema while the destination continues serving traffic from the `public` schema
+- **Resource Separation**: Restore operations consume separate database resources, preventing interference with destination queries
+- **Atomic Cutover**: The final schema swap is instantaneous using PostgreSQL's atomic `ALTER SCHEMA RENAME` operations
+
+### Connection Management
+
+- **Connection Pooling**: Uses PostgreSQL connection pools with configurable limits (default: 20 max connections)
+- **Dedicated Restore Connections**: Restore operations use a separate connection pool to avoid starving application connections
+- **Automatic Cleanup**: Connections are properly closed and released after each migration phase
+
+### Performance Controls
+
+- **Parallel Job Limiting**: pg_restore parallel jobs are configurable and capped at CPU count to prevent resource exhaustion
+- **Binary Dump Format**: Uses PostgreSQL's binary dump format for maximum transfer efficiency and reduced I/O load
+- **Incremental Processing**: Large operations are broken into phases to distribute load over time
+
+### Load Distribution
+
+- **Read-Only Source Protection**: Source database is temporarily made read-only during dump creation to ensure consistency
+- **Constraint Management**: Foreign key constraints are temporarily disabled during restore to reduce validation overhead
+- **Index Recreation**: Indexes are rebuilt after data loading for optimal performance without blocking restore operations
+
+### Monitoring and Safeguards
+
+- **Progress Tracking**: Real-time monitoring of migration progress with detailed logging
+- **Resource Monitoring**: Built-in checks for available disk space and database connectivity
+- **Timeout Protection**: Configurable timeouts prevent runaway operations from consuming resources indefinitely
+- **Automatic Rollback**: Failed migrations automatically trigger cleanup and rollback procedures
+
+### Destination Continuity
+
+- **Zero-Downtime Design**: Destination applications continue operating normally during the entire migration process
+- **Instant Activation**: New schema becomes active immediately via atomic operations (typically <100ms)
+- **Preserved Table Sync**: Critical tables can be kept synchronized in real-time during migration
+- **Rollback Capability**: Complete rollback to original state available if issues are detected
+
+These protections ensure that even large-scale migrations can be performed safely on destination systems without service disruption or performance degradation.
+
 ## Key Features
 
 ### Zero-Downtime Operation
