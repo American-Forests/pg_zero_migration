@@ -10,8 +10,8 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import path from 'path';
 import fs from 'fs';
 import { DbTestLoaderMulti } from './db-test-loader-multi.js';
-import { DatabaseMigrator, parseDatabaseUrl } from './migration-core.js';
-import { DatabaseRollback } from './db-rollback.js';
+import { DatabaseMigrator, parseDatabaseUrl } from '../migration-core.js';
+import { DatabaseRollback } from '../db-rollback.js';
 
 describe('Database Migration Integration Tests', () => {
   // Test database configuration

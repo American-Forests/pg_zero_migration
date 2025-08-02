@@ -9,7 +9,7 @@ import { readFile } from 'fs/promises';
 import { existsSync } from 'fs';
 import type { Client } from 'pg';
 import { DbTestFixtureLoader, FixtureLoadError } from './db-test-fixture-loader.js';
-import type { TableSchema, DatabaseSchema } from './db-schema-types.js';
+import type { TableSchema, DatabaseSchema } from '../db-schema-types.js';
 
 // Mock dependencies
 vi.mock('fs/promises', () => ({

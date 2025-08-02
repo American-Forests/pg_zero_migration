@@ -27,10 +27,10 @@
  */
 
 import { Client, ClientConfig } from 'pg';
-import { DbSchemaParser } from './db-schema-parser.js';
-import { DbSqlGenerator } from './db-sql-generator.js';
+import { DbSchemaParser } from '../db-schema-parser.js';
+import { DbSqlGenerator } from '../db-sql-generator.js';
 import { DbTestFixtureLoader } from './db-test-fixture-loader.js';
-import type { DatabaseSchema } from './db-schema-types.js';
+import type { DatabaseSchema } from '../db-schema-types.js';
 
 /**
  * Custom error classes for better error handling

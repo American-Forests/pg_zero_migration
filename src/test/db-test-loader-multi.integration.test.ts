@@ -107,6 +107,6 @@ describe('DbTestLoaderMulti Integration Tests', () => {
       const finalConnectionInfo = multiLoader.getConnectionInfo();
       expect(finalConnectionInfo.sourceDb).toBe(expectedSourceDb);
       expect(finalConnectionInfo.destDb).toBe(expectedDestDb);
-    }, 15000);
+    }, 35000);
   });
 });

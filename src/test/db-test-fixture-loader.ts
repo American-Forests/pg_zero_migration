@@ -5,7 +5,7 @@
 
 import fs from 'fs';
 import { Client } from 'pg';
-import { DatabaseSchema } from './db-schema-types.js';
+import { DatabaseSchema } from '../db-schema-types.js';
 
 export class FixtureLoadError extends Error {
   constructor(
