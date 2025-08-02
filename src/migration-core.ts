@@ -80,6 +80,8 @@ export interface SyncTriggerInfo {
   isActive: boolean;
   checksum?: string;
   rowCount?: number;
+  validationStatus?: 'pending' | 'passed' | 'failed';
+  lastValidated?: Date;
 }
 
 export interface SyncValidationResult {
@@ -674,6 +676,123 @@ export class DatabaseMigrator {
       this.stats.errors.push(`Post-swap validation failed: ${error}`);
       this.log(`❌ Post-swap validation failed: ${error}`);
       throw error; // Re-throw since this is critical
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Validate sync trigger exists and is properly configured
+   * Lightweight check without data manipulation
+   */
+  private async validateTriggerExists(triggerInfo: SyncTriggerInfo): Promise<void> {
+    const client = await this.destPool.connect();
+    try {
+      // Check trigger exists and is enabled
+      const triggerCheck = await client.query(
+        `
+        SELECT tgname, tgenabled
+        FROM pg_trigger t
+        JOIN pg_class c ON c.oid = t.tgrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public'
+        AND c.relname = $1
+        AND t.tgname = $2
+      `,
+        [triggerInfo.tableName, triggerInfo.triggerName]
+      );
+
+      if (triggerCheck.rows.length === 0) {
+        throw new Error(`Sync trigger ${triggerInfo.triggerName} was not created`);
+      }
+
+      const triggerEnabled = triggerCheck.rows[0].tgenabled;
+      if (triggerEnabled !== 'O') {
+        throw new Error(`Sync trigger ${triggerInfo.triggerName} is not enabled`);
+      }
+
+      // Check function exists
+      const functionCheck = await client.query(
+        `
+        SELECT proname
+        FROM pg_proc
+        WHERE proname = $1
+      `,
+        [triggerInfo.functionName]
+      );
+
+      if (functionCheck.rows.length === 0) {
+        throw new Error(`Sync trigger function ${triggerInfo.functionName} was not created`);
+      }
+
+      triggerInfo.validationStatus = 'passed';
+      triggerInfo.lastValidated = new Date();
+
+      this.log(`✅ Sync trigger validated: ${triggerInfo.triggerName}`);
+    } catch (error) {
+      triggerInfo.validationStatus = 'failed';
+      triggerInfo.lastValidated = new Date();
+      throw new Error(`Sync trigger validation failed: ${error}`);
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Validate sync trigger health before schema swap
+   * Basic health check without data manipulation
+   */
+  private async validateTriggerHealth(triggerInfos: SyncTriggerInfo[]): Promise<void> {
+    if (triggerInfos.length === 0) {
+      return;
+    }
+
+    this.log(`🔍 Validating health of ${triggerInfos.length} sync triggers...`);
+
+    const client = await this.destPool.connect();
+    try {
+      for (const triggerInfo of triggerInfos) {
+        try {
+          // Quick existence check
+          const triggerCheck = await client.query(
+            `
+            SELECT tgname, tgenabled
+            FROM pg_trigger t
+            JOIN pg_class c ON c.oid = t.tgrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = 'public'
+            AND c.relname = $1
+            AND t.tgname = $2
+          `,
+            [triggerInfo.tableName, triggerInfo.triggerName]
+          );
+
+          if (triggerCheck.rows.length === 0) {
+            this.stats.warnings.push(`Sync trigger ${triggerInfo.triggerName} no longer exists`);
+            triggerInfo.validationStatus = 'failed';
+            continue;
+          }
+
+          const triggerEnabled = triggerCheck.rows[0].tgenabled;
+          if (triggerEnabled !== 'O') {
+            this.stats.warnings.push(`Sync trigger ${triggerInfo.triggerName} is disabled`);
+            triggerInfo.validationStatus = 'failed';
+            continue;
+          }
+
+          triggerInfo.validationStatus = 'passed';
+        } catch (error) {
+          this.stats.warnings.push(
+            `Sync trigger health check failed for ${triggerInfo.tableName}: ${error}`
+          );
+          triggerInfo.validationStatus = 'failed';
+        }
+      }
+
+      const validTriggers = triggerInfos.filter(t => t.validationStatus === 'passed').length;
+      this.log(
+        `✅ Sync trigger health validation complete: ${validTriggers}/${triggerInfos.length} triggers healthy`
+      );
     } finally {
       client.release();
     }
@@ -1320,6 +1439,9 @@ export class DatabaseMigrator {
   private async performAtomicSchemaSwap(timestamp: number): Promise<void> {
     this.log('🔄 Phase 4: Performing atomic schema swap...');
 
+    // Validate all sync triggers are healthy before proceeding
+    await this.validateTriggerHealth(this.activeSyncTriggers);
+
     const client = await this.destPool.connect();
 
     try {
@@ -1426,6 +1548,9 @@ export class DatabaseMigrator {
           triggerInfo.checksum = `sync_${timestamp}`; // Use timestamp for tracking
           this.activeSyncTriggers.push(triggerInfo);
 
+          // Step 2.1: Validate trigger was created successfully
+          await this.validateTriggerExists(triggerInfo);
+
           // Step 3: Validate initial sync
           const validation = await this.validateSyncConsistency(actualTableName);
           if (!validation.isValid) {
@@ -1528,6 +1653,8 @@ export class DatabaseMigrator {
       functionName,
       triggerName,
       isActive: true,
+      validationStatus: 'pending',
+      lastValidated: undefined,
     };
   }
 
@@ -1549,14 +1676,14 @@ export class DatabaseMigrator {
       // and shadow schema no longer exists in the expected state
       this.log('ℹ️ Skipping sync validation - migration already completed and live');
 
-      // Cleanup triggers
-      await this.cleanupRealtimeSync(this.activeSyncTriggers);
+      // Cleanup triggers - pass the backup schema name since triggers are now on backup schema after swap
+      await this.cleanupRealtimeSync(this.activeSyncTriggers, `backup_${timestamp}`);
 
       this.log(`✅ Sync triggers cleaned up and validation complete (backup_${timestamp})`);
     } catch (error) {
       // Ensure triggers are cleaned up even if validation fails
       try {
-        await this.cleanupRealtimeSync(this.activeSyncTriggers);
+        await this.cleanupRealtimeSync(this.activeSyncTriggers, `backup_${timestamp}`);
       } catch (cleanupError) {
         this.logError('Failed to cleanup triggers after validation error', cleanupError);
       }
@@ -1567,7 +1694,10 @@ export class DatabaseMigrator {
   /**
    * Cleanup real-time sync triggers
    */
-  private async cleanupRealtimeSync(triggerInfos: SyncTriggerInfo[]): Promise<void> {
+  private async cleanupRealtimeSync(
+    triggerInfos: SyncTriggerInfo[],
+    schemaName: string = 'public'
+  ): Promise<void> {
     if (triggerInfos.length === 0) {
       return;
     }
@@ -1579,10 +1709,51 @@ export class DatabaseMigrator {
     try {
       for (const triggerInfo of triggerInfos) {
         try {
-          // Drop trigger
-          await client.query(
-            `DROP TRIGGER IF EXISTS ${triggerInfo.triggerName} ON public.${triggerInfo.tableName}`
+          // First check what triggers actually exist for this table
+          const existingTriggers = await client.query(
+            `
+            SELECT trigger_name, event_manipulation
+            FROM information_schema.triggers 
+            WHERE trigger_name = $1 AND event_object_table = $2 AND event_object_schema = $3
+            ORDER BY event_manipulation
+          `,
+            [triggerInfo.triggerName, triggerInfo.tableName, schemaName]
           );
+
+          if (existingTriggers.rows.length === 0) {
+            this.log(
+              `ℹ️ No triggers found for ${triggerInfo.triggerName} on ${schemaName}."${triggerInfo.tableName}"`
+            );
+            continue;
+          }
+
+          this.log(
+            `🔍 Found ${existingTriggers.rows.length} trigger entries for ${triggerInfo.triggerName}: ${existingTriggers.rows.map(r => r.event_manipulation).join(', ')}`
+          );
+
+          // Drop trigger from the correct schema (backup schema after swap)
+          await client.query(
+            `DROP TRIGGER IF EXISTS ${triggerInfo.triggerName} ON ${schemaName}."${triggerInfo.tableName}"`
+          );
+
+          // Verify trigger cleanup by checking information_schema again
+          const remainingTriggers = await client.query(
+            `
+            SELECT trigger_name, event_manipulation
+            FROM information_schema.triggers 
+            WHERE trigger_name = $1 AND event_object_table = $2 AND event_object_schema = $3
+          `,
+            [triggerInfo.triggerName, triggerInfo.tableName, schemaName]
+          );
+
+          if (remainingTriggers.rows.length > 0) {
+            this.logError(
+              `Warning: ${remainingTriggers.rows.length} trigger entries still exist for ${triggerInfo.triggerName} (${remainingTriggers.rows.map(r => r.event_manipulation).join(', ')})`,
+              new Error('Trigger cleanup may be incomplete')
+            );
+          } else {
+            this.log(`✅ Successfully dropped all trigger entries for ${triggerInfo.triggerName}`);
+          }
 
           // Drop function
           await client.query(`DROP FUNCTION IF EXISTS ${triggerInfo.functionName}()`);

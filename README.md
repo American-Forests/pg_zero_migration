@@ -34,7 +34,7 @@ The migration process follows a carefully orchestrated 8-phase approach:
 ### Phase 3: Setup Preserved Table Synchronization
 
 1. **Preserved Table Validation**: Validates that preserved tables exist in destination schema
-2. **Real-time Sync Setup**: Creates triggers for real-time synchronization of preserved tables
+2. **Real-time Sync Setup**: Creates triggers for real-time synchronization of preserved tables to shadow ensuring up to date right until schema swap
 3. **Initial Sync**: Copies current preserved table data to shadow schema
 
 ### Phase 4: Perform Atomic Schema Swap
