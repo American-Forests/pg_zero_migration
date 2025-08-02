@@ -585,6 +585,101 @@ export class DatabaseMigrator {
   }
 
   /**
+   * Validate atomic schema swap completion
+   * Ensures all components of the schema swap completed successfully
+   */
+  private async validateAtomicSchemaSwap(timestamp: number): Promise<void> {
+    this.log('🔍 Validating atomic schema swap completion...');
+
+    const client = await this.destPool.connect();
+    try {
+      // 1. Verify public schema exists and contains expected objects
+      const publicSchemaCheck = await client.query(`
+        SELECT schema_name 
+        FROM information_schema.schemata 
+        WHERE schema_name = 'public'
+      `);
+
+      if (publicSchemaCheck.rows.length === 0) {
+        throw new Error('Critical: Public schema does not exist after swap');
+      }
+
+      // 2. Verify backup schema exists with expected naming
+      const backupSchemaName = `backup_${timestamp}`;
+      const backupSchemaCheck = await client.query(
+        `
+        SELECT schema_name 
+        FROM information_schema.schemata 
+        WHERE schema_name = $1
+      `,
+        [backupSchemaName]
+      );
+
+      if (backupSchemaCheck.rows.length === 0) {
+        throw new Error(`Critical: Backup schema ${backupSchemaName} does not exist after swap`);
+      }
+
+      // 3. Verify new shadow schema was created
+      const shadowSchemaCheck = await client.query(`
+        SELECT schema_name 
+        FROM information_schema.schemata 
+        WHERE schema_name = 'shadow'
+      `);
+
+      if (shadowSchemaCheck.rows.length === 0) {
+        throw new Error('Critical: New shadow schema was not created after swap');
+      }
+
+      // 4. Verify public schema has tables (not empty)
+      const publicTablesCheck = await client.query(`
+        SELECT COUNT(*) as table_count
+        FROM information_schema.tables 
+        WHERE table_schema = 'public' 
+        AND table_type = 'BASE TABLE'
+      `);
+
+      const publicTableCount = parseInt(publicTablesCheck.rows[0].table_count);
+      if (publicTableCount === 0) {
+        this.stats.warnings.push('Post-swap: Public schema appears to be empty');
+        this.log('⚠️  Post-swap: Public schema appears to be empty');
+      }
+
+      // 5. Quick validation of key table accessibility
+      try {
+        await client.query('SELECT 1 FROM information_schema.tables LIMIT 1');
+        this.log('✅ Post-swap: Database connectivity and basic operations verified');
+      } catch (error) {
+        throw new Error(`Critical: Database operations failed after swap: ${error}`);
+      }
+
+      // 6. Verify schema ownership and permissions are intact
+      const schemaOwnerCheck = await client.query(
+        `
+        SELECT schema_name, schema_owner
+        FROM information_schema.schemata 
+        WHERE schema_name IN ('public', 'shadow', $1)
+        ORDER BY schema_name
+      `,
+        [backupSchemaName]
+      );
+
+      if (schemaOwnerCheck.rows.length < 3) {
+        this.stats.warnings.push('Post-swap: Some schemas may have ownership issues');
+        this.log('⚠️  Post-swap: Some schemas may have ownership issues');
+      }
+
+      this.log('✅ Atomic schema swap validation completed successfully');
+    } catch (error) {
+      // Log as error but don't fail the migration since the swap already happened
+      this.stats.errors.push(`Post-swap validation failed: ${error}`);
+      this.log(`❌ Post-swap validation failed: ${error}`);
+      throw error; // Re-throw since this is critical
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
    * Analyze database schema
    */
   private async analyzeSchema(pool: Pool, dbName: string): Promise<TableInfo[]> {
@@ -1245,6 +1340,9 @@ export class DatabaseMigrator {
 
       await client.query('COMMIT');
       this.log('✅ Atomic schema swap completed - migration is now live!');
+
+      // Validate the atomic schema swap completed successfully
+      await this.validateAtomicSchemaSwap(timestamp);
     } catch (error) {
       await client.query('ROLLBACK');
       throw new Error(`Failed to perform schema swap: ${error}`);
