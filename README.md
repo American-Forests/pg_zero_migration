@@ -169,10 +169,10 @@ yarn test:integration
 yarn test:integration --reporter=verbose
 
 # Run specific test file
-yarn test:integration db_migration.integration.test.ts
+yarn test:integration migration.integration.test.ts
 
 # Run specific test in test file
-yarn test:integration --run db_migration.integration.test.ts -t "should perform complete migration"
+yarn test:integration --run migration.integration.test.ts -t "should perform complete migration"
 
 # Override a test variable
 TEST_PGHOST=192.168.4.24 yarn test:integration
@@ -216,7 +216,7 @@ yarn test:integration --reporter=verbose
 
 # Run single test with custom environment
 TEST_PGHOST=192.168.4.24 \
-yarn test:integration --run --reporter=verbose db_migration.integration.test.ts
+yarn test:integration --run --reporter=verbose migration.integration.test.ts
 ```
 
 ### Test Database Requirements

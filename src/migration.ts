@@ -10,7 +10,7 @@ import {
   DatabaseConfig,
   MigrationResult,
 } from './migration-core.js';
-import { DatabaseRollback } from './db-rollback.js';
+import { DatabaseRollback } from './rollback.js';
 import { fileURLToPath } from 'url';
 interface BackupInfo {
   timestamp: number;

@@ -1,5 +1,5 @@
 /**
- * Integration Tests for db_migration.ts
+ * Integration Tests for migration.ts
  *
  * These tests verify the complete database migration workflow using real PostgreSQL databases.
  * The test creates source and destination databases, loads them with different data,
@@ -9,9 +9,9 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import path from 'path';
 import fs from 'fs';
-import { DbTestLoaderMulti } from './db-test-loader-multi.js';
+import { DbTestLoaderMulti } from './test-loader-multi.js';
 import { DatabaseMigrator, parseDatabaseUrl } from '../migration-core.js';
-import { DatabaseRollback } from '../db-rollback.js';
+import { DatabaseRollback } from '../rollback.js';
 
 describe('Database Migration Integration Tests', () => {
   // Test database configuration

@@ -7,7 +7,7 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import path from 'path';
-import { DbTestLoaderMulti } from './db-test-loader-multi.js';
+import { DbTestLoaderMulti } from './test-loader-multi.js';
 
 describe('DbTestLoaderMulti Integration Tests', () => {
   // Test database configuration

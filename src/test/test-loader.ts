@@ -12,7 +12,7 @@
  * - Managing test data lifecycle
  *
  * Usage:
- *   import { DbTestLoader } from './db-test-loader.js';
+ *   import { DbTestLoader } from './test-loader.js';
  *
  *   const loader = new DbTestLoader(databaseUrl, schemaPath, fixtureFile);
  *   await loader.setupDatabaseSchema();
@@ -27,10 +27,10 @@
  */
 
 import { Client, ClientConfig } from 'pg';
-import { DbSchemaParser } from '../db-schema-parser.js';
-import { DbSqlGenerator } from '../db-sql-generator.js';
-import { DbTestFixtureLoader } from './db-test-fixture-loader.js';
-import type { DatabaseSchema } from '../db-schema-types.js';
+import { DbSchemaParser } from '../util/db-schema-parser.js';
+import { DbSqlGenerator } from '../util/db-sql-generator.js';
+import { DbTestFixtureLoader } from './test-fixture-loader.js';
+import type { DatabaseSchema } from '../util/db-schema-types.js';
 
 /**
  * Custom error classes for better error handling

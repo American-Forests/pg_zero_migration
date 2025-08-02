@@ -25,9 +25,9 @@
     "test:integration": "vitest run --project=integration",
     "test:all": "vitest run",
     "build": "yarn run typecheck && yarn run compile",
-    "migrate": "yarn build && node ./dist/db_migration.js",
-    "migrate:dev": "tsx src/db_migration.ts",
-    "migration": "tsx src/db_migration.ts",
+    "migrate": "yarn build && node ./dist/migration.js",
+    "migrate:dev": "tsx src/migration.ts",
+    "migration": "tsx src/migration.ts",
     "validate": "yarn build && node ./dist/validate_migration.js",
     "validate:dev": "tsx src/validate_migration.ts"
   },

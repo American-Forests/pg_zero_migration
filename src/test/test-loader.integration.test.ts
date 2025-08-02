@@ -12,7 +12,7 @@ import {
   DatabaseConnectionError,
   SchemaSetupError,
   DataLoadingError,
-} from './db-test-loader.js';
+} from './test-loader.js';
 
 beforeAll(() => {
   // Set timeout for all tests in this file to 30 seconds

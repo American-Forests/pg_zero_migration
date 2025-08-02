@@ -12,7 +12,7 @@
  * - Cleanup operations
  *
  * Usage:
- *   import { DbTestLoaderMulti } from './db-test-loader-multi.js';
+ *   import { DbTestLoaderMulti } from './test-loader-multi.js';
  *
  *   const manager = new DbTestLoaderMulti(sourceUrl, destUrl, schemaPath);
  *   await manager.createTestDatabases();
@@ -26,7 +26,7 @@
  */
 
 import { URL } from 'url';
-import { DbTestLoader } from './db-test-loader.js';
+import { DbTestLoader } from './test-loader.js';
 
 /**
  * Custom error classes for multi-database operations

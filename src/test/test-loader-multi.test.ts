@@ -6,15 +6,11 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import {
-  DbTestLoaderMulti,
-  MultiDatabaseError,
-  type ConnectionInfo,
-} from './db-test-loader-multi.js';
-import { DbTestLoader } from './db-test-loader.js';
+import { DbTestLoaderMulti, MultiDatabaseError, type ConnectionInfo } from './test-loader-multi.js';
+import { DbTestLoader } from './test-loader.js';
 
 // Mock the dependencies
-vi.mock('./db-test-loader.js', () => ({
+vi.mock('./test-loader.js', () => ({
   DbTestLoader: vi.fn().mockImplementation(() => ({
     createTestDatabase: vi.fn().mockResolvedValue(true),
     cleanupTestDatabase: vi.fn().mockResolvedValue(true),

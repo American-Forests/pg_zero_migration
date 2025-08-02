@@ -15,7 +15,7 @@ import {
   SchemaSetupError,
   DataLoadingError,
   PrismaError,
-} from './db-test-loader.js';
+} from './test-loader.js';
 
 // Mock dependencies with proper hoisting
 vi.mock('pg', () => ({
