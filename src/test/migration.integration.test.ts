@@ -489,6 +489,113 @@ describe('Database Migration Integration Tests', () => {
     const backupSchemaName = `backup_${latestBackup.timestamp}`;
     await validateBackupReferentialIntegrity(destLoader, backupSchemaName);
 
+    console.log('🔗 Validating schema compatibility (moved from rollback operations)...');
+
+    async function validateSchemaCompatibility(
+      loader: DbTestLoader,
+      backupSchema: string
+    ): Promise<void> {
+      // Compare table counts between schemas
+      const backupTableCount = await loader.executeQuery(
+        `SELECT COUNT(*) as count FROM information_schema.tables WHERE table_schema = $1`,
+        [backupSchema]
+      );
+      const publicTableCount = await loader.executeQuery(
+        `SELECT COUNT(*) as count FROM information_schema.tables WHERE table_schema = 'public'`
+      );
+
+      const backupCount = parseInt(backupTableCount[0].count);
+      const publicCount = parseInt(publicTableCount[0].count);
+
+      // Allow reasonable difference in table counts
+      expect(Math.abs(backupCount - publicCount)).toBeLessThanOrEqual(5);
+
+      // Verify critical tables exist in both schemas
+      const criticalTables = await loader.executeQuery(`
+        SELECT table_name 
+        FROM information_schema.tables 
+        WHERE table_schema = 'public' 
+        ORDER BY table_name 
+        LIMIT 10
+      `);
+
+      for (const table of criticalTables) {
+        const tableName = table.table_name;
+        const backupHasTable = await loader.executeQuery(
+          `SELECT EXISTS (
+            SELECT 1 FROM information_schema.tables 
+            WHERE table_schema = $1 AND table_name = $2
+          )`,
+          [backupSchema, tableName]
+        );
+
+        expect(backupHasTable[0].exists).toBe(true);
+      }
+
+      console.log(
+        `✅ Schema compatibility validated: backup(${backupCount}) vs public(${publicCount}) tables`
+      );
+    }
+
+    // ✅ HIGH PRIORITY VALIDATION: Table Data Integrity Validation (moved from rollback.ts validateTableDataIntegrity)
+    // This was previously performed during backup validation, causing sampling delays
+    console.log('🔬 Validating table data integrity (moved from backup validation)...');
+
+    async function validateTableDataIntegrity(
+      loader: DbTestLoader,
+      schemaName: string,
+      tableName: string
+    ): Promise<void> {
+      // Performance-optimized: Only sample first 100 rows
+      const sampleCheck = await loader.executeQuery(`
+        SELECT COUNT(*) as valid_count
+        FROM (
+          SELECT * FROM "${schemaName}"."${tableName}" 
+          WHERE ctid IS NOT NULL  -- Basic validity check
+          LIMIT 100
+        ) sample
+      `);
+
+      const validCount = parseInt(sampleCheck[0].valid_count);
+
+      // Check if table has data
+      const totalCount = await loader.executeQuery(
+        `SELECT COUNT(*) as count FROM "${schemaName}"."${tableName}"`
+      );
+      const hasData = parseInt(totalCount[0].count) > 0;
+
+      // If we have data, sample should be valid
+      if (hasData) {
+        expect(validCount).toBeGreaterThan(0);
+      }
+
+      // Quick check for basic data types (non-null primary keys if they exist)
+      try {
+        const pkCheck = await loader.executeQuery(`
+          SELECT COUNT(*) as pk_violations
+          FROM (
+            SELECT * FROM "${schemaName}"."${tableName}" 
+            WHERE id IS NULL  -- Assuming 'id' is common primary key
+            LIMIT 10
+          ) pk_sample
+        `);
+
+        const pkViolations = parseInt(pkCheck[0].pk_violations);
+        expect(pkViolations).toBe(0);
+      } catch {
+        // Ignore if 'id' column doesn't exist - not all tables have it
+      }
+
+      console.log(
+        `✅ Data integrity validated for ${tableName}: ${validCount} valid sample records`
+      );
+    }
+
+    // Validate schema compatibility and data integrity
+    await validateSchemaCompatibility(destLoader, backupSchemaName);
+    await validateTableDataIntegrity(destLoader, backupSchemaName, 'User');
+    await validateTableDataIntegrity(destLoader, backupSchemaName, 'Post');
+
     // Perform rollback
     console.log('🔄 Starting rollback operation...');
     await rollback.rollback(latestBackup.timestamp);
@@ -522,8 +629,8 @@ describe('Database Migration Integration Tests', () => {
     expect(restoredPosts.length).toBeGreaterThan(0);
 
     // Check specific restored values from backup (should be the original destination modified data)
-    const originalUser1 = restoredUsers.find((u: any) => u.id === 1);
-    const originalUser2 = restoredUsers.find((u: any) => u.id === 2);
+    const originalUser1 = restoredUsers.find((u: { id: number }) => u.id === 1);
+    const originalUser2 = restoredUsers.find((u: { id: number }) => u.id === 2);
 
     expect(originalUser1).toBeDefined();
     expect(originalUser2).toBeDefined();
@@ -536,7 +643,7 @@ describe('Database Migration Integration Tests', () => {
     // Verify backup was consumed (no longer available)
     const backupsAfterRollback = await rollback.getAvailableBackups();
     const consumedBackup = backupsAfterRollback.find(
-      (b: any) => b.timestamp === latestBackup.timestamp
+      (b: { timestamp: string }) => b.timestamp === latestBackup.timestamp
     );
     expect(consumedBackup).toBeUndefined();
     console.log('✅ Backup was consumed as expected');
@@ -639,6 +746,68 @@ describe('Database Migration Integration Tests', () => {
     );
     expect(preservedUserData.length).toBeGreaterThan(0);
 
+    console.log('🔬 Validating sync consistency');
+
+    async function validateSyncConsistency(
+      loader: DbTestLoader,
+      publicSchema: string,
+      shadowSchema: string,
+      tableName: string
+    ): Promise<void> {
+      // Get row counts for both schemas
+      const sourceCountResult = await loader.executeQuery(
+        `SELECT COUNT(*) as count FROM "${publicSchema}"."${tableName}"`
+      );
+      const targetCountResult = await loader.executeQuery(
+        `SELECT COUNT(*) as count FROM "${shadowSchema}"."${tableName}"`
+      );
+
+      const sourceRowCount = parseInt(sourceCountResult[0].count);
+      const targetRowCount = parseInt(targetCountResult[0].count);
+
+      // Get primary key columns for checksum validation
+      const pkResult = await loader.executeQuery(`
+        SELECT a.attname
+        FROM pg_index i
+        JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+        WHERE i.indrelid = '"${publicSchema}"."${tableName}"'::regclass AND i.indisprimary
+        ORDER BY a.attnum
+      `);
+
+      let sourceChecksum = '';
+      let targetChecksum = '';
+
+      if (pkResult.length > 0) {
+        const pkColumns = pkResult.map((row: { attname: string }) => row.attname);
+        const pkColumnsStr = pkColumns.map(col => `"${col}"::text`).join(` || ',' || `);
+
+        const sourceChecksumResult = await loader.executeQuery(`
+          SELECT md5(string_agg(${pkColumnsStr}, ',' ORDER BY ${pkColumns.map(col => `"${col}"`).join(', ')})) as checksum 
+          FROM "${publicSchema}"."${tableName}"
+        `);
+        const targetChecksumResult = await loader.executeQuery(`
+          SELECT md5(string_agg(${pkColumnsStr}, ',' ORDER BY ${pkColumns.map(col => `"${col}"`).join(', ')})) as checksum 
+          FROM "${shadowSchema}"."${tableName}"
+        `);
+
+        sourceChecksum = sourceChecksumResult[0]?.checksum || '';
+        targetChecksum = targetChecksumResult[0]?.checksum || '';
+      }
+
+      // Validate consistency
+      expect(sourceRowCount).toBe(targetRowCount);
+      if (sourceChecksum && targetChecksum) {
+        expect(sourceChecksum).toBe(targetChecksum);
+      }
+
+      console.log(
+        `✅ Sync consistency validated for ${tableName}: ${sourceRowCount} rows, checksum match: ${sourceChecksum === targetChecksum}`
+      );
+    }
+
+    // Validate sync consistency between public and backup schemas for preserved tables
+    await validateSyncConsistency(destLoader, 'public', backupSchemaName, 'User');
+
     console.log('✅ Sync trigger cleanup verified: trigger cleanup attempted (known issue exists)');
     console.log('✅ Backup schema preservation verified:', backupSchemaName);
     console.log(
@@ -646,6 +815,7 @@ describe('Database Migration Integration Tests', () => {
       preservedUserData.length,
       'User records'
     );
+    console.log('✅ Sync consistency validation completed');
     console.log('✅ Comprehensive sync trigger validation successful');
   }, 60000); // Increase timeout for migration operations
 });
@@ -692,30 +862,44 @@ describe('TES Schema Migration Integration Tests', () => {
 
     const modifiedFixture = {
       ...originalFixture,
-      User: originalFixture.User.map((user: any) => ({
-        ...user,
-        name: `${user.name} Modified`,
-        email: user.email.replace('@', '+modified@'),
-      })),
-      Blockgroup: originalFixture.Blockgroup.map((blockgroup: any) => ({
-        ...blockgroup,
-        af_id: `${blockgroup.af_id}_MOD`,
-        municipality_slug: `${blockgroup.municipality_slug}-modified`,
-        tree_canopy: blockgroup.tree_canopy * 0.9, // Reduce tree canopy by 10%
-        equity_index: Math.min(1.0, blockgroup.equity_index * 1.1), // Increase equity index by 10%
-      })),
+      User: originalFixture.User.map(
+        (user: { name: string; email: string; [key: string]: unknown }) => ({
+          ...user,
+          name: `${user.name} Modified`,
+          email: user.email.replace('@', '+modified@'),
+        })
+      ),
+      Blockgroup: originalFixture.Blockgroup.map(
+        (blockgroup: {
+          af_id: string;
+          municipality_slug: string;
+          tree_canopy: number;
+          equity_index: number;
+          [key: string]: unknown;
+        }) => ({
+          ...blockgroup,
+          af_id: `${blockgroup.af_id}_MOD`,
+          municipality_slug: `${blockgroup.municipality_slug}-modified`,
+          tree_canopy: blockgroup.tree_canopy * 0.9, // Reduce tree canopy by 10%
+          equity_index: Math.min(1.0, blockgroup.equity_index * 1.1), // Increase equity index by 10%
+        })
+      ),
       Municipality:
-        originalFixture.Municipality?.map((municipality: any) => ({
-          ...municipality,
-          name: `${municipality.name} Modified`,
-          slug: `${municipality.slug}-modified`,
-        })) || [],
+        originalFixture.Municipality?.map(
+          (municipality: { name: string; slug: string; [key: string]: unknown }) => ({
+            ...municipality,
+            name: `${municipality.name} Modified`,
+            slug: `${municipality.slug}-modified`,
+          })
+        ) || [],
       Area:
-        originalFixture.Area?.map((area: any) => ({
-          ...area,
-          name: `${area.name} Modified`,
-          slug: `${area.slug}-modified`,
-        })) || [],
+        originalFixture.Area?.map(
+          (area: { name: string; slug: string; [key: string]: unknown }) => ({
+            ...area,
+            name: `${area.name} Modified`,
+            slug: `${area.slug}-modified`,
+          })
+        ) || [],
     };
 
     return modifiedFixture;

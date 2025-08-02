@@ -8,7 +8,7 @@ This file provides guidance to Copilot when working with code in this repository
 - Avoid apologizing or making conciliatory statements.
 - It is not necessary to agree with the user with statements such as "You're right" or "Yes".
 - Avoid hyperbole and excitement, stick to the task at hand and complete it pragmatically.
-- Ask me before simplifying the problem or solution because you can't figure out how to solve it.
+- Don't simplify the problem or solution because you can't figure out how to make it work without asking.
 
 ## 📚 Onboarding
 
@@ -40,3 +40,5 @@ When writing code, Copilot must not finish until all of these succeed:
 3. `yarn lint`
 4. `yarn test`
 5. `TEST_PGHOST=192.168.4.24 yarn test:integration`
+
+- Do not generate comments or notes that specify that code was moved to another location or specify where the code was moved from to the current location.  Don't comment on why it was moved.

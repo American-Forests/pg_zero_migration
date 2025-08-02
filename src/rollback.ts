@@ -196,9 +196,6 @@ export class DatabaseRollback {
         return result;
       }
 
-      // Enhanced validation: Check schema compatibility with current public schema
-      await this.validateSchemaCompatibility(client, schemaName, result);
-
       // Get all tables in backup schema
       const tablesResult = await client.query(
         `
@@ -248,9 +245,6 @@ export class DatabaseRollback {
           if (rowCount === 0) {
             result.warnings.push(`Table ${tableName} is empty`);
           }
-
-          // Enhanced validation: Data corruption check (sample-based for performance)
-          await this.validateTableDataIntegrity(client, schemaName, tableName, validation);
         } catch (error) {
           validation.isValid = false;
           validation.errors.push(`Validation error: ${error}`);
