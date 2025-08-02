@@ -31,6 +31,11 @@ Include with generated code:
 - JSDoc comments for all public functions and classes.
 - Code comments for complex logic.
 
+## Code Quality
+
+- Do not generate code comments that mention code was moved or why it was moved.
+- Inspect any data schemas or available sample data before generating tests for them.  Don't make stuff up.
+
 ## ✅ Quality Gates
 
 When writing code, Copilot must not finish until all of these succeed:
@@ -40,5 +45,3 @@ When writing code, Copilot must not finish until all of these succeed:
 3. `yarn lint`
 4. `yarn test`
 5. `TEST_PGHOST=192.168.4.24 yarn test:integration`
-
-- Do not generate comments or notes that specify that code was moved to another location or specify where the code was moved from to the current location.  Don't comment on why it was moved.
