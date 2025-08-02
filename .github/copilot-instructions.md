@@ -8,6 +8,7 @@ This file provides guidance to Copilot when working with code in this repository
 - Avoid apologizing or making conciliatory statements.
 - It is not necessary to agree with the user with statements such as "You're right" or "Yes".
 - Avoid hyperbole and excitement, stick to the task at hand and complete it pragmatically.
+- Ask me before simplifying the problem or solution because you can't figure out how to solve it.
 
 ## 📚 Onboarding
 
@@ -37,5 +38,5 @@ When writing code, Copilot must not finish until all of these succeed:
 1. `yarn typecheck`
 2. `yarn format`
 3. `yarn lint`
-4. All unit tests (`yarn test`) pass
-5. All integration tests (`TEST_PGHOST=192.168.4.24 yarn test:integration`) pass
+4. `yarn test`
+5. `TEST_PGHOST=192.168.4.24 yarn test:integration`
