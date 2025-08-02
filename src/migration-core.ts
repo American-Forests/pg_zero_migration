@@ -613,66 +613,6 @@ export class DatabaseMigrator {
   }
 
   /**
-   * Validate sync trigger health before schema swap
-   * Basic health check without data manipulation
-   */
-  private async validateTriggerHealth(triggerInfos: SyncTriggerInfo[]): Promise<void> {
-    if (triggerInfos.length === 0) {
-      return;
-    }
-
-    this.log(`🔍 Validating health of ${triggerInfos.length} sync triggers...`);
-
-    const client = await this.destPool.connect();
-    try {
-      for (const triggerInfo of triggerInfos) {
-        try {
-          // Quick existence check
-          const triggerCheck = await client.query(
-            `
-            SELECT tgname, tgenabled
-            FROM pg_trigger t
-            JOIN pg_class c ON c.oid = t.tgrelid
-            JOIN pg_namespace n ON n.oid = c.relnamespace
-            WHERE n.nspname = 'public'
-            AND c.relname = $1
-            AND t.tgname = $2
-          `,
-            [triggerInfo.tableName, triggerInfo.triggerName]
-          );
-
-          if (triggerCheck.rows.length === 0) {
-            this.stats.warnings.push(`Sync trigger ${triggerInfo.triggerName} no longer exists`);
-            triggerInfo.validationStatus = 'failed';
-            continue;
-          }
-
-          const triggerEnabled = triggerCheck.rows[0].tgenabled;
-          if (triggerEnabled !== 'O') {
-            this.stats.warnings.push(`Sync trigger ${triggerInfo.triggerName} is disabled`);
-            triggerInfo.validationStatus = 'failed';
-            continue;
-          }
-
-          triggerInfo.validationStatus = 'passed';
-        } catch (error) {
-          this.stats.warnings.push(
-            `Sync trigger health check failed for ${triggerInfo.tableName}: ${error}`
-          );
-          triggerInfo.validationStatus = 'failed';
-        }
-      }
-
-      const validTriggers = triggerInfos.filter(t => t.validationStatus === 'passed').length;
-      this.log(
-        `✅ Sync trigger health validation complete: ${validTriggers}/${triggerInfos.length} triggers healthy`
-      );
-    } finally {
-      client.release();
-    }
-  }
-
-  /**
    * Analyze database schema
    */
   private async analyzeSchema(pool: Pool, dbName: string): Promise<TableInfo[]> {
@@ -1312,9 +1252,6 @@ export class DatabaseMigrator {
    */
   private async performAtomicSchemaSwap(timestamp: number): Promise<void> {
     this.log('🔄 Phase 4: Performing atomic schema swap...');
-
-    // Validate all sync triggers are healthy before proceeding
-    await this.validateTriggerHealth(this.activeSyncTriggers);
 
     const client = await this.destPool.connect();
 
