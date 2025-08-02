@@ -537,15 +537,7 @@ export class DatabaseMigrator {
       let violationCount = 0;
       const violationDetails: string[] = [];
 
-      // Limit validation to first 10 foreign keys to avoid performance issues
-      const fkToCheck = foreignKeys.rows.slice(0, 10);
-      if (foreignKeys.rows.length > 10) {
-        this.stats.warnings.push(
-          `${dbName}: Only checking first 10 of ${foreignKeys.rows.length} foreign keys for performance`
-        );
-      }
-
-      for (const fk of fkToCheck) {
+      for (const fk of foreignKeys.rows) {
         try {
           // Use a LIMIT to make this faster - just check if ANY violations exist
           const orphanCheck = await pool.query(`
@@ -583,7 +575,7 @@ export class DatabaseMigrator {
       }
 
       this.log(
-        `✅ ${dbName} foreign key integrity validated (${fkToCheck.length} constraints checked)`
+        `✅ ${dbName} foreign key integrity validated (${foreignKeys.rows.length} constraints checked)`
       );
     } catch (error) {
       // Log all errors as warnings but don't fail the migration (for timing analysis)

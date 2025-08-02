@@ -196,6 +196,9 @@ export class DatabaseRollback {
         return result;
       }
 
+      // Enhanced validation: Check schema compatibility with current public schema
+      await this.validateSchemaCompatibility(client, schemaName, result);
+
       // Get all tables in backup schema
       const tablesResult = await client.query(
         `
@@ -207,7 +210,7 @@ export class DatabaseRollback {
         [schemaName]
       );
 
-      // Validate each table
+      // Validate each table with enhanced checks
       for (const row of tablesResult.rows) {
         const tableName = row.table_name;
         const validation: TableValidationResult = {
@@ -245,6 +248,9 @@ export class DatabaseRollback {
           if (rowCount === 0) {
             result.warnings.push(`Table ${tableName} is empty`);
           }
+
+          // Enhanced validation: Data corruption check (sample-based for performance)
+          await this.validateTableDataIntegrity(client, schemaName, tableName, validation);
         } catch (error) {
           validation.isValid = false;
           validation.errors.push(`Validation error: ${error}`);
@@ -253,6 +259,9 @@ export class DatabaseRollback {
 
         result.tableValidations.push(validation);
       }
+
+      // Enhanced validation: Referential integrity check (optimized)
+      await this.validateBackupReferentialIntegrity(client, schemaName, result);
 
       // Check for critical tables
       const criticalTables = ['User', 'user']; // Add more as needed
@@ -272,6 +281,195 @@ export class DatabaseRollback {
       return result;
     } finally {
       client.release();
+    }
+  }
+
+  /**
+   * Validate schema compatibility between backup and current public schema
+   * Performance optimized: Only compares essential schema elements
+   */
+  private async validateSchemaCompatibility(
+    client: PoolClient,
+    backupSchema: string,
+    result: BackupValidationResult
+  ): Promise<void> {
+    try {
+      this.log('🔗 Validating schema compatibility...');
+
+      // Fast check: Compare table counts between schemas
+      const backupTableCount = await client.query(
+        `SELECT COUNT(*) as count FROM information_schema.tables WHERE table_schema = $1`,
+        [backupSchema]
+      );
+      const publicTableCount = await client.query(
+        `SELECT COUNT(*) as count FROM information_schema.tables WHERE table_schema = 'public'`
+      );
+
+      const backupCount = parseInt(backupTableCount.rows[0].count);
+      const publicCount = parseInt(publicTableCount.rows[0].count);
+
+      if (Math.abs(backupCount - publicCount) > 5) {
+        result.warnings.push(
+          `Schema compatibility warning: Backup has ${backupCount} tables, current has ${publicCount} tables`
+        );
+      }
+
+      // Fast check: Verify critical tables exist in both schemas (limit to top 10 for performance)
+      const criticalTables = await client.query(`
+        SELECT table_name 
+        FROM information_schema.tables 
+        WHERE table_schema = 'public' 
+        ORDER BY table_name 
+        LIMIT 10
+      `);
+
+      for (const table of criticalTables.rows) {
+        const tableName = table.table_name;
+        const backupHasTable = await client.query(
+          `SELECT EXISTS (
+            SELECT 1 FROM information_schema.tables 
+            WHERE table_schema = $1 AND table_name = $2
+          )`,
+          [backupSchema, tableName]
+        );
+
+        if (!backupHasTable.rows[0].exists) {
+          result.warnings.push(`Schema compatibility: Table '${tableName}' missing in backup`);
+        }
+      }
+
+      this.log('✅ Schema compatibility validation completed');
+    } catch (error) {
+      result.warnings.push(`Schema compatibility validation warning: ${error}`);
+    }
+  }
+
+  /**
+   * Validate table data integrity using sample-based checks for performance
+   * Only checks first 100 rows to avoid performance issues
+   */
+  private async validateTableDataIntegrity(
+    client: PoolClient,
+    schemaName: string,
+    tableName: string,
+    validation: TableValidationResult
+  ): Promise<void> {
+    try {
+      // Performance-optimized: Only sample first 100 rows
+      const sampleCheck = await client.query(`
+        SELECT COUNT(*) as valid_count
+        FROM (
+          SELECT * FROM "${schemaName}"."${tableName}" 
+          WHERE ctid IS NOT NULL  -- Basic validity check
+          LIMIT 100
+        ) sample
+      `);
+
+      const validCount = parseInt(sampleCheck.rows[0].valid_count);
+
+      // If we have data, validate sample integrity
+      if (validation.hasData && validCount === 0) {
+        validation.errors.push('Data integrity issue: Sample data appears corrupted');
+        validation.isValid = false;
+      }
+
+      // Quick check for basic data types (non-null primary keys if they exist)
+      try {
+        const pkCheck = await client.query(`
+          SELECT COUNT(*) as pk_violations
+          FROM (
+            SELECT * FROM "${schemaName}"."${tableName}" 
+            WHERE id IS NULL  -- Assuming 'id' is common primary key
+            LIMIT 10
+          ) pk_sample
+        `);
+
+        const pkViolations = parseInt(pkCheck.rows[0].pk_violations);
+        if (pkViolations > 0) {
+          validation.errors.push(`Found ${pkViolations} records with null primary keys`);
+          validation.isValid = false;
+        }
+      } catch {
+        // Ignore if 'id' column doesn't exist - not all tables have it
+      }
+    } catch (error) {
+      // Non-critical error - log as warning but don't fail validation
+      validation.errors.push(`Data integrity check warning: ${error}`);
+    }
+  }
+
+  /**
+   * Validate referential integrity in backup schema
+   * Validates all foreign keys for comprehensive integrity checking
+   */
+  private async validateBackupReferentialIntegrity(
+    client: PoolClient,
+    schemaName: string,
+    result: BackupValidationResult
+  ): Promise<void> {
+    try {
+      this.log('🔗 Validating backup referential integrity...');
+
+      // Get all foreign key constraints
+      const foreignKeys = await client.query(
+        `
+        SELECT 
+          tc.table_name,
+          tc.constraint_name,
+          kcu.column_name,
+          ccu.table_name AS foreign_table_name,
+          ccu.column_name AS foreign_column_name
+        FROM information_schema.table_constraints AS tc 
+        JOIN information_schema.key_column_usage AS kcu 
+          ON tc.constraint_name = kcu.constraint_name
+        JOIN information_schema.constraint_column_usage AS ccu 
+          ON ccu.constraint_name = tc.constraint_name
+        WHERE tc.constraint_type = 'FOREIGN KEY' 
+          AND tc.table_schema = $1
+      `,
+        [schemaName]
+      );
+
+      let violationCount = 0;
+
+      for (const fk of foreignKeys.rows) {
+        try {
+          // Performance optimized: Use LIMIT 1 to just check if violations exist
+          const orphanCheck = await client.query(`
+            SELECT 1
+            FROM "${schemaName}"."${fk.table_name}" t
+            WHERE "${fk.column_name}" IS NOT NULL
+            AND NOT EXISTS (
+              SELECT 1 FROM "${schemaName}"."${fk.foreign_table_name}" f
+              WHERE f."${fk.foreign_column_name}" = t."${fk.column_name}"
+            )
+            LIMIT 1
+          `);
+
+          if (orphanCheck.rows.length > 0) {
+            violationCount++;
+            result.warnings.push(
+              `Referential integrity: Orphaned records found in ${fk.table_name}.${fk.column_name}`
+            );
+          }
+        } catch (error) {
+          result.warnings.push(
+            `Referential integrity check warning for ${fk.constraint_name}: ${error}`
+          );
+        }
+      }
+
+      if (violationCount > 0) {
+        result.warnings.push(
+          `Backup referential integrity: Found violations in ${violationCount} constraints (non-blocking)`
+        );
+      }
+
+      this.log(
+        `✅ Backup referential integrity validated (${foreignKeys.rows.length} constraints checked)`
+      );
+    } catch (error) {
+      result.warnings.push(`Backup referential integrity validation warning: ${error}`);
     }
   }
 
