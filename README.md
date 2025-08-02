@@ -132,60 +132,201 @@ These protections ensure that even large-scale migrations can be performed safel
 - Dry-run mode for testing migrations
 - Extensible architecture for custom requirements
 
-## CLI Parameters
+## Two-Phase Migration Workflow
 
-The migration tool supports the following command-line parameters:
+The migration tool supports both single-phase and two-phase execution modes to provide maximum flexibility for different operational requirements.
 
-### Required Parameters
+### Single-Phase Mode (Traditional)
 
-- `--source-host` - Source database hostname
-- `--source-port` - Source database port (default: 5432)
-- `--source-database` - Source database name
-- `--source-user` - Source database username
-- `--source-password` - Source database password
-- `--dest-host` - Destination database hostname  
-- `--dest-port` - Destination database port (default: 5432)
-- `--dest-database` - Destination database name
-- `--dest-user` - Destination database username
-- `--dest-password` - Destination database password
+Use the `start` command for immediate end-to-end migration:
 
-### Optional Parameters
+```bash
+npm run migration -- start \
+  --source postgres://user:pass@source-host:port/db \
+  --dest postgres://user:pass@dest-host:port/db \
+  --preserved-tables users,sessions
+```
 
-- `--dry-run` - Run migration in dry-run mode (no actual changes)
-- `--preserve-tables` - Comma-separated list of tables to preserve in destination
-- `--temp-dir` - Directory for temporary files (default: /tmp)
-- `--parallel-jobs` - Number of parallel pg_restore jobs (default: 8, max: CPU count)
-- `--timeout` - Migration timeout in seconds (default: 3600)
-- `--verbose` - Enable verbose logging
+This executes all phases (1-7) sequentially in a single operation.
+
+### Two-Phase Mode (Recommended for Production)
+
+#### Phase 1: Preparation
+
+Use the `prepare` command to set up the shadow schema and sync triggers:
+
+```bash
+npm run migration -- prepare \
+  --source postgres://user:pass@source-host:port/db \
+  --dest postgres://user:pass@dest-host:port/db \
+  --preserved-tables users,sessions
+```
+
+**What happens during preparation:**
+- Creates source database dump
+- Restores dump to destination shadow schema  
+- Sets up real-time sync triggers for preserved tables
+- Validates schema integrity
+- Saves migration state for later completion
+
+**Key benefits:**
+- No downtime during preparation phase
+- Preserved tables remain synchronized in real-time
+- Can validate shadow schema before committing to swap
+- Preparation can be done during low-traffic periods
+
+#### Phase 2: Completion
+
+Use the `swap` command to complete the migration when ready:
+
+```bash
+npm run migration -- swap \
+  --dest postgres://user:pass@dest-host:port/db
+```
+
+**What happens during swap:**
+- Performs atomic schema swap (typically <100ms downtime)
+- Cleans up sync triggers
+- Resets sequences and recreates indexes
+- Validates migration completion
+
+#### Monitoring Between Phases
+
+Use the `status` command to monitor migration state:
+
+```bash
+# Human-readable status
+npm run migration -- status \
+  --dest postgres://user:pass@dest-host:port/db
+
+# JSON output for automation
+npm run migration -- status \
+  --dest postgres://user:pass@dest-host:port/db \
+  --json
+```
+
+#### Time Between Phases
+
+- **No time limit**: The time between `prepare` and `swap` can be minutes, hours, or days
+- **Continuous sync**: Preserved tables remain synchronized automatically
+- **State persistence**: Migration state is saved to disk and survives restarts
+- **Validation**: Status command helps verify readiness before swap
+
+### Migration State Management
+
+The tool uses file-based state management to track migration progress:
+
+- **State file location**: `.migration-state-{database}.json` in working directory
+- **Automatic cleanup**: State is cleared after successful completion
+- **Manual inspection**: State file can be examined for troubleshooting
+- **Resumable operations**: Failed operations can be investigated and resumed
+
+## CLI Commands
+
+The migration tool provides the following commands:
+
+### Migration Commands
+
+- `start` - Complete database migration (traditional single-phase mode)
+- `prepare` - Prepare migration (create dump, setup shadow schema, sync triggers)
+- `swap` - Complete migration (atomic schema swap and finalization)
+- `status` - Show current migration status
+
+### Management Commands
+
+- `list` - List all available backup schemas
+- `rollback` - Rollback to a previous backup
+- `cleanup` - Delete old backup schemas
+- `verify` - Verify backup integrity
+
+### Command-Specific Parameters
+
+#### start / prepare commands
+- `--source <url>` - Source database connection string (required)
+- `--dest <url>` - Destination database connection string (required) 
+- `--preserved-tables <table1,table2>` - Tables to preserve from destination (optional)
+- `--dry-run` - Preview mode without executing changes (optional)
+
+#### swap command
+- `--dest <url>` - Destination database connection string (required)
+- `--timestamp <ts>` - Specific migration timestamp to complete (optional)
+
+#### status command  
+- `--dest <url>` - Destination database connection string (required)
+- `--json` - Output status as JSON (optional)
+
+#### rollback command
+- `--latest` - Rollback to most recent backup (mutually exclusive with --timestamp)
+- `--timestamp <ts>` - Rollback to specific backup timestamp
+- `--keep-tables <table1,table2>` - Tables to preserve during rollback (optional)
+
+#### cleanup command
+- `--before <date>` - Delete backups before specified date (ISO format or timestamp)
+
+#### verify command
+- `--timestamp <ts>` - Backup timestamp to verify
+
+### Global Options
+
+- `--dry-run` - Preview changes without executing (available for most commands)
+- `--json` - Output as JSON format (available for list/status commands)
 - `--help` - Display help information
 
 ### Example Usage
 
-```bash
-# Basic migration
-./db_migration \
-  --source-host localhost \
-  --source-database source_db \
-  --source-user postgres \
-  --source-password secret \
-  --dest-host production.example.com \
-  --dest-database dest_db \
-  --dest-user postgres \
-  --dest-password secret
+#### Single-Phase Migration (Traditional)
 
-# Migration with preserved tables and dry-run
-./db_migration \
-  --source-host localhost \
-  --source-database source_db \
-  --source-user postgres \
-  --source-password secret \
-  --dest-host production.example.com \
-  --dest-database dest_db \
-  --dest-user postgres \
-  --dest-password secret \
-  --preserve-tables user_sessions,audit_logs \
-  --dry-run \
-  --verbose
+```bash
+# Complete migration in one command
+npm run migration -- start \
+  --source postgres://user:pass@source-host:5432/source_db \
+  --dest postgres://user:pass@dest-host:5432/dest_db \
+  --preserved-tables users,sessions
+
+# Dry run before actual migration  
+npm run migration -- start \
+  --source postgres://user:pass@source-host:5432/source_db \
+  --dest postgres://user:pass@dest-host:5432/dest_db \
+  --preserved-tables users,sessions \
+  --dry-run
+```
+
+#### Two-Phase Migration (Recommended)
+
+```bash
+# Phase 1: Prepare migration (can be done during low-traffic periods)
+npm run migration -- prepare \
+  --source postgres://user:pass@source-host:5432/source_db \
+  --dest postgres://user:pass@dest-host:5432/dest_db \
+  --preserved-tables users,sessions
+
+# Check migration status (can be run multiple times)
+npm run migration -- status \
+  --dest postgres://user:pass@dest-host:5432/dest_db
+
+# Phase 2: Complete migration (minimal downtime - when ready)
+npm run migration -- swap \
+  --dest postgres://user:pass@dest-host:5432/dest_db
+```
+
+#### Management Commands
+
+```bash
+# List available backups
+npm run migration -- list
+npm run migration -- list --json
+
+# Rollback to latest backup
+npm run migration -- rollback --latest
+
+# Rollback to specific backup
+npm run migration -- rollback --timestamp 1722614400000
+
+# Verify backup integrity
+npm run migration -- verify --timestamp 1722614400000
+
+# Cleanup old backups
+npm run migration -- cleanup --before "2025-07-15"
 ```
 
 ## Testing

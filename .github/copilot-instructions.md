@@ -47,4 +47,4 @@ When writing code, Copilot must not finish until all of these succeed:
 5. `TEST_PGHOST=192.168.4.24 yarn test:integration`
 
 Last changes:
-- Update the README.md with any new features or changes.
+- Update the README.md with any significant new features or changes.

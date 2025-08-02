@@ -9,6 +9,7 @@ import {
   parseDatabaseUrl,
   DatabaseConfig,
   MigrationResult,
+  PreparationResult,
 } from './migration-core.js';
 import { DatabaseRollback } from './rollback.js';
 import { fileURLToPath } from 'url';
@@ -283,18 +284,22 @@ Usage: npm run migration <command> [options]
 
 Commands:
   list                                    List all available backup schemas
-  start --source <url> --dest <url>       Start database migration
+  start --source <url> --dest <url>       Start complete database migration (prepare + swap)
+  prepare --source <url> --dest <url>     Prepare migration (create dump, setup shadow schema)
+  swap --dest <url> [--timestamp <ts>]    Complete migration (atomic schema swap)
+  status --dest <url>                     Show current migration status
   rollback --latest                       Rollback to most recent backup
   rollback --timestamp <ts>               Rollback to specific backup timestamp
   cleanup --before <date>                 Delete backups before specified date
   verify --timestamp <ts>                 Verify backup integrity
 
 Options:
-  --source <url>                         Source database URL (for start command)
-  --dest <url>                           Destination database URL (for start command)
-  --preserved-tables <table1,table2>     Tables to preserve during migration (for start command)
+  --source <url>                         Source database URL (for start/prepare commands)
+  --dest <url>                           Destination database URL (for all commands)
+  --preserved-tables <table1,table2>     Tables to preserve during migration (for start/prepare commands)
+  --timestamp <ts>                       Specific migration timestamp (for swap command)
   --keep-tables <table1,table2>          Tables to preserve during rollback
-  --json                                 Output as JSON (list command only)
+  --json                                 Output as JSON (list/status commands)
   --dry-run                              Preview changes without executing
   --help                                 Show this help message
 
@@ -302,7 +307,10 @@ Examples:
   npm run migration -- list
   npm run migration -- list --json
   npm run migration -- start --source postgres://user:pass@host:port/db --dest postgres://user:pass@host:port/db
-  npm run migration -- start --source postgres://... --dest postgres://... --preserved-tables users,sessions --dry-run
+  npm run migration -- prepare --source postgres://... --dest postgres://... --preserved-tables users,sessions
+  npm run migration -- status --dest postgres://...
+  npm run migration -- swap --dest postgres://...
+  npm run migration -- swap --dest postgres://... --timestamp 1753207951602
   npm run migration -- rollback --latest
   npm run migration -- rollback --timestamp 1753207951602
   npm run migration -- rollback --latest --keep-tables users,sessions
@@ -315,6 +323,11 @@ Date Formats:
   ISO Date: 2025-07-15
   Date + Time: 2025-07-15 10:30
   Timestamp: 1753207951602
+
+Two-Phase Migration Workflow:
+  1. Run 'prepare' to create shadow schema and setup sync triggers
+  2. Monitor and validate the shadow schema (preserved tables stay synced)
+  3. Run 'swap' when ready to complete the migration (zero downtime)
 `);
 }
 
@@ -417,6 +430,18 @@ async function main(): Promise<void> {
         await handleStartCommand(values, dryRun);
         break;
 
+      case 'prepare':
+        await handlePrepareCommand(values, dryRun);
+        break;
+
+      case 'swap':
+        await handleSwapCommand(values, dryRun);
+        break;
+
+      case 'status':
+        await handleStatusCommand(values);
+        break;
+
       case 'list':
       case 'rollback':
       case 'cleanup':
@@ -432,6 +457,239 @@ async function main(): Promise<void> {
   } catch (error) {
     console.error('\n❌ Error:', error instanceof Error ? error.message : error);
     process.exit(1);
+  }
+}
+
+async function handlePrepareCommand(values: ParsedArgs, dryRun: boolean): Promise<void> {
+  const sourceUrl = values.source || process.env.SOURCE_DATABASE_URL;
+  const destUrl = values.dest || process.env.DEST_DATABASE_URL || process.env.DATABASE_URL;
+  const preservedTablesEnv = values['preserved-tables'] || process.env.PRESERVED_TABLES || '';
+
+  if (!sourceUrl || !destUrl) {
+    console.error('❌ Prepare command requires:');
+    console.error('   --source <url> - Source database connection string');
+    console.error('   --dest <url> - Destination database connection string');
+    console.error('   Optional: --preserved-tables <table1,table2> - Tables to preserve');
+    console.error('   Optional: --dry-run - Preview mode');
+    process.exit(1);
+  }
+
+  const preservedTables = preservedTablesEnv
+    .split(',')
+    .map((table: string) => table.trim())
+    .filter((table: string) => table.length > 0);
+
+  const sourceConfig = parseDatabaseUrl(sourceUrl);
+  const destConfig = parseDatabaseUrl(destUrl);
+
+  console.log('🚀 Database Migration Tool - Preparation Phase');
+  console.log(`📍 Source: ${sourceConfig.host}:${sourceConfig.port}/${sourceConfig.database}`);
+  console.log(`📍 Destination: ${destConfig.host}:${destConfig.port}/${destConfig.database}`);
+  console.log(`🔒 Preserved tables: ${preservedTables.join(', ') || 'none'}`);
+  console.log('');
+
+  const migrator = new DatabaseMigrator(sourceConfig, destConfig, preservedTables, dryRun);
+
+  try {
+    const result: PreparationResult = await migrator.prepareMigration();
+
+    if (result.success) {
+      if (dryRun) {
+        console.log('\n✅ Dry run preparation completed successfully!');
+        console.log('💡 Review the analysis above and run without --dry-run when ready');
+      } else {
+        console.log('\n✅ Migration preparation completed successfully!');
+        console.log(`📄 Migration ID: ${result.migrationId}`);
+        console.log(`🔢 Timestamp: ${result.timestamp}`);
+        console.log(`🔄 Active sync triggers: ${result.activeTriggers.length}`);
+        console.log('📦 Shadow schema ready for swap');
+
+        // Generate the exact swap command to run next
+        let swapCommand = `npm run migration -- swap --dest "${destUrl}"`;
+        if (preservedTables.length > 0) {
+          swapCommand += ` --preserved-tables "${preservedTables.join(',')}"`;
+        }
+        swapCommand += ` --timestamp ${result.timestamp}`;
+
+        console.log('');
+        console.log('� Next step: Run the swap command to complete the migration:');
+        console.log(`   ${swapCommand}`);
+      }
+      process.exit(0);
+    } else {
+      console.error('\n❌ Migration preparation failed:', result.error);
+      process.exit(1);
+    }
+  } catch (error) {
+    console.error('\n❌ Migration preparation failed with unexpected error:', error);
+    process.exit(1);
+  }
+}
+
+async function handleSwapCommand(values: ParsedArgs, dryRun: boolean): Promise<void> {
+  const destUrl = values.dest || process.env.DEST_DATABASE_URL || process.env.DATABASE_URL;
+  const preservedTablesEnv = values['preserved-tables'] || process.env.PRESERVED_TABLES || '';
+
+  if (!destUrl) {
+    console.error('❌ Swap command requires:');
+    console.error('   --dest <url> - Destination database connection string');
+    console.error(
+      '   Optional: --preserved-tables <table1,table2> - Tables that should have sync triggers'
+    );
+    console.error('   Optional: --dry-run - Preview mode (not recommended for swap)');
+    process.exit(1);
+  }
+
+  const destConfig = parseDatabaseUrl(destUrl);
+  const preservedTables = preservedTablesEnv
+    .split(',')
+    .map((table: string) => table.trim())
+    .filter((table: string) => table.length > 0);
+
+  console.log('🔄 Database Migration Tool - Swap Phase');
+  console.log(`📍 Destination: ${destConfig.host}:${destConfig.port}/${destConfig.database}`);
+  console.log(`� Expected preserved tables: ${preservedTables.join(', ') || 'none'}`);
+  console.log('');
+
+  const migrator = new DatabaseMigrator({} as DatabaseConfig, destConfig, preservedTables, dryRun);
+
+  try {
+    const result: MigrationResult = await migrator.completeMigration(preservedTables);
+
+    if (result.success) {
+      console.log('\n✅ Migration swap completed successfully!');
+      console.log('📦 Schema backup retained for rollback purposes');
+      process.exit(0);
+    } else {
+      console.error('\n❌ Migration swap failed:', result.error);
+      process.exit(1);
+    }
+  } catch (error) {
+    console.error('\n❌ Migration swap failed with unexpected error:', error);
+    process.exit(1);
+  }
+}
+
+async function handleStatusCommand(values: ParsedArgs): Promise<void> {
+  const destUrl = values.dest || process.env.DEST_DATABASE_URL || process.env.DATABASE_URL;
+  const json = values.json || false;
+
+  if (!destUrl) {
+    console.error('❌ Status command requires:');
+    console.error('   --dest <url> - Destination database connection string');
+    console.error('   Optional: --json - Output as JSON');
+    process.exit(1);
+  }
+
+  const destConfig = parseDatabaseUrl(destUrl);
+
+  if (!json) {
+    console.log('🔍 Database Migration Status');
+    console.log(`📍 Destination: ${destConfig.host}:${destConfig.port}/${destConfig.database}`);
+    console.log('');
+  }
+
+  // Create direct connection for status checking
+  const { Pool } = await import('pg');
+  const pool = new Pool({
+    ...destConfig,
+    ssl: destConfig.ssl !== false ? { rejectUnauthorized: false } : false,
+  });
+
+  try {
+    const client = await pool.connect();
+
+    try {
+      // Check shadow schema
+      const shadowExists = await client.query(`
+        SELECT EXISTS (
+          SELECT 1 FROM information_schema.schemata 
+          WHERE schema_name = 'shadow'
+        )
+      `);
+
+      // Count shadow tables
+      const shadowTables = await client.query(`
+        SELECT COUNT(*) as count
+        FROM information_schema.tables 
+        WHERE table_schema = 'shadow'
+      `);
+
+      // Count sync triggers
+      const syncTriggers = await client.query(`
+        SELECT COUNT(*) as count
+        FROM information_schema.triggers 
+        WHERE trigger_name LIKE 'sync_%_to_shadow_trigger'
+      `);
+
+      // Find backup schemas
+      const backupSchemas = await client.query(`
+        SELECT schema_name 
+        FROM information_schema.schemata 
+        WHERE schema_name LIKE 'backup_%'
+        ORDER BY schema_name DESC
+      `);
+
+      const shadowSchemaExists = shadowExists.rows[0].exists;
+      const shadowTableCount = parseInt(shadowTables.rows[0].count);
+      const syncTriggerCount = parseInt(syncTriggers.rows[0].count);
+      const backupCount = backupSchemas.rows.length;
+
+      if (json) {
+        console.log(
+          JSON.stringify(
+            {
+              shadowSchemaExists,
+              shadowTableCount,
+              syncTriggerCount,
+              backupCount,
+              backupSchemas: backupSchemas.rows.map((r: { schema_name: string }) => r.schema_name),
+              readyForSwap: shadowSchemaExists && shadowTableCount > 0,
+            },
+            null,
+            2
+          )
+        );
+        return;
+      }
+
+      // Human-readable status
+      console.log(`📦 Shadow schema exists: ${shadowSchemaExists ? '✅' : '❌'}`);
+      console.log(`📊 Shadow tables: ${shadowTableCount}`);
+      console.log(`🔄 Active sync triggers: ${syncTriggerCount}`);
+      console.log(`�️  Backup schemas: ${backupCount}`);
+
+      if (backupCount > 0) {
+        console.log(
+          `   Latest backups: ${backupSchemas.rows
+            .slice(0, 3)
+            .map((r: { schema_name: string }) => r.schema_name)
+            .join(', ')}`
+        );
+      }
+
+      console.log('');
+
+      if (shadowSchemaExists && shadowTableCount > 0) {
+        console.log('🚀 Status: READY FOR SWAP');
+        console.log('💡 Run the swap command to complete the migration');
+      } else if (shadowSchemaExists && shadowTableCount === 0) {
+        console.log('⚠️  Status: SHADOW SCHEMA EMPTY');
+        console.log('💡 Run the prepare command to populate the shadow schema');
+      } else {
+        console.log('� Status: NO MIGRATION PREPARED');
+        console.log('💡 Run the prepare command to start a new migration');
+      }
+    } finally {
+      client.release();
+    }
+
+    process.exit(0);
+  } catch (error) {
+    console.error('\n❌ Failed to get migration status:', error);
+    process.exit(1);
+  } finally {
+    await pool.end();
   }
 }
 

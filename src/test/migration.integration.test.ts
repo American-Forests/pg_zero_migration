@@ -1001,6 +1001,139 @@ describe('Database Migration Integration Tests', () => {
     console.log('✅ Sync consistency validation completed');
     console.log('✅ Comprehensive sync trigger validation successful');
   }, 60000); // Increase timeout for migration operations
+
+  it('should handle all error scenarios in two-phase migration workflow', async () => {
+    console.log('🚀 Starting error scenarios test...');
+
+    const destLoader = multiLoader.getDestLoader();
+    if (!destLoader) {
+      throw new Error('Test loader not initialized');
+    }
+
+    const sourceLoader = multiLoader.getSourceLoader();
+    if (!sourceLoader) {
+      throw new Error('Source loader not initialized');
+    }
+
+    // Load test data for error testing
+    await sourceLoader.loadTestData();
+    await destLoader.loadTestData();
+
+    const sourceConfig = parseDatabaseUrl(expectedSourceUrl);
+    const destConfig = parseDatabaseUrl(expectedDestUrl);
+
+    // Test 1: Swap without prepare
+    console.log('❌ Testing swap without prepare...');
+    const errorMigrator1 = new DatabaseMigrator(sourceConfig, destConfig);
+
+    const result1 = await errorMigrator1.completeMigration();
+    expect(result1.success).toBe(false);
+    expect(result1.error).toContain('Shadow schema does not exist');
+    console.log('✅ Correctly failed when trying to swap without prepare');
+
+    // Test 2: Reset and prepare successfully
+    console.log('🔧 Running prepareMigration...');
+    const errorMigrator2 = new DatabaseMigrator(sourceConfig, destConfig, ['User']);
+    const prepareResult = await errorMigrator2.prepareMigration();
+    expect(prepareResult.success).toBe(true);
+    console.log('✅ Preparation successful');
+
+    // Test 3: Preserved tables mismatch
+    console.log('❌ Testing preserved tables mismatch...');
+    const errorMigrator3 = new DatabaseMigrator(sourceConfig, destConfig);
+
+    const result3 = await errorMigrator3.completeMigration(['DifferentTable']);
+    expect(result3.success).toBe(false);
+    expect(result3.error).toContain('Preserved table');
+    console.log('✅ Correctly failed when preserved tables mismatch');
+
+    // Test 4: Shadow schema corruption
+    console.log('❌ Testing shadow schema corruption...');
+
+    // Corrupt shadow schema by dropping a table
+    await destLoader.executeQuery('DROP TABLE IF EXISTS shadow."User" CASCADE');
+
+    const errorMigrator4 = new DatabaseMigrator(sourceConfig, destConfig, ['User']);
+    const result4 = await errorMigrator4.completeMigration(['User']);
+    expect(result4.success).toBe(false);
+    console.log('✅ Correctly failed when shadow schema corrupted');
+
+    // Test 5: Verify databases can recover
+    console.log('🔄 Verifying database recovery...');
+
+    // Clean up corrupted state
+    await destLoader.executeQuery('DROP SCHEMA IF EXISTS shadow CASCADE');
+
+    // Verify we can still perform operations
+    const userCount = await destLoader.executeQuery('SELECT COUNT(*) as count FROM "User"');
+    expect(parseInt(userCount[0].count)).toBeGreaterThan(0);
+    console.log('✅ Database recovery verified - databases remain functional');
+
+    console.log('✅ All error scenarios tested successfully');
+  }, 90000); // Extended timeout for error testing
+
+  it('should perform dry run prepare without making changes', async () => {
+    console.log('🚀 Starting dry run test...');
+
+    const destLoader = multiLoader.getDestLoader();
+    if (!destLoader) {
+      throw new Error('Test loader not initialized');
+    }
+
+    // Load test data first for dry run to have something to analyze
+    const sourceLoader = multiLoader.getSourceLoader();
+    if (!sourceLoader) {
+      throw new Error('Source loader not initialized');
+    }
+    await sourceLoader.loadTestData();
+    await destLoader.loadTestData();
+
+    // Record initial state
+    const initialSchemas = await destLoader.executeQuery(`
+      SELECT schema_name FROM information_schema.schemata 
+      WHERE schema_name IN ('shadow', 'public')
+      ORDER BY schema_name
+    `);
+
+    const initialTriggers = await destLoader.executeQuery(`
+      SELECT COUNT(*) as count FROM information_schema.triggers 
+      WHERE trigger_name LIKE 'sync_%'
+    `);
+
+    // Run dry run preparation
+    console.log('🧪 Running dry run prepareMigration...');
+    const sourceConfig = parseDatabaseUrl(expectedSourceUrl);
+    const destConfig = parseDatabaseUrl(expectedDestUrl);
+    const dryRunMigrator = new DatabaseMigrator(sourceConfig, destConfig, [], true); // dry run = true
+
+    const dryRunResult = await dryRunMigrator.prepareMigration();
+    expect(dryRunResult.success).toBe(true);
+    console.log('✅ Dry run completed successfully');
+
+    // Verify no shadow schema created
+    const finalSchemas = await destLoader.executeQuery(`
+      SELECT schema_name FROM information_schema.schemata 
+      WHERE schema_name IN ('shadow', 'public')
+      ORDER BY schema_name
+    `);
+    expect(finalSchemas).toEqual(initialSchemas);
+    console.log('✅ No shadow schema created during dry run');
+
+    // Verify no triggers created
+    const finalTriggers = await destLoader.executeQuery(`
+      SELECT COUNT(*) as count FROM information_schema.triggers 
+      WHERE trigger_name LIKE 'sync_%'
+    `);
+    expect(parseInt(finalTriggers[0].count)).toBe(parseInt(initialTriggers[0].count));
+    console.log('✅ No sync triggers created during dry run');
+
+    // Verify databases remain unchanged (should have test data)
+    const userCount = await destLoader.executeQuery('SELECT COUNT(*) as count FROM "User"');
+    expect(parseInt(userCount[0].count)).toBeGreaterThan(0);
+    console.log('✅ Databases remain in original state after dry run');
+
+    console.log('✅ Dry run test completed successfully');
+  }, 60000);
 });
 
 describe('TES Schema Migration Integration Tests', () => {
@@ -1137,8 +1270,8 @@ describe('TES Schema Migration Integration Tests', () => {
     const modifiedTesFixturePath = path.resolve(__dirname, 'modified_tes_fixture.json');
     fs.writeFileSync(modifiedTesFixturePath, JSON.stringify(modifiedTesFixture, null, 2));
 
-    // Initialize loaders with REVERSED fixture data
-    // Destination gets original data, source gets modified data
+    // Initialize loaders with modified fixture for source, original fixture for destination
+    // This ensures source has the additional TreeCanopy record and modified data
     multiLoader.initializeLoaders(modifiedTesFixturePath, tesOriginalFixturePath);
 
     // Then create test databases
@@ -1790,7 +1923,7 @@ describe('TES Schema Migration Integration Tests', () => {
         console.log(`📊 ${table} geometry data: ${geomData.length} records with geometries`);
 
         // Verify that geometries are properly stored (not null)
-        geomData.forEach((row: any) => {
+        geomData.forEach((row: Record<string, unknown>) => {
           expect(row.geom).toBeDefined();
           expect(row.geom).not.toBeNull();
         });
@@ -1822,6 +1955,351 @@ describe('TES Schema Migration Integration Tests', () => {
 
     console.log('✅ Complete TES migration and data verification successful');
   }, 120000); // Extended timeout for complex TES migration
+
+  it('should perform complete two-phase migration with preserved tables and sync functionality using TES schema', async () => {
+    console.log('🚀 Starting comprehensive two-phase migration test with TES schema...');
+
+    // Get database loaders for easier data manipulation
+    const sourceLoader = multiLoader.getSourceLoader();
+    const destLoader = multiLoader.getDestLoader();
+
+    if (!sourceLoader || !destLoader) {
+      throw new Error('Test loaders not initialized');
+    }
+
+    // Clean up any leftover sync triggers from previous test runs
+    console.log('🧹 Cleaning up any existing sync triggers...');
+    await destLoader.executeQuery(`
+      DO $$ 
+      DECLARE 
+        r RECORD;
+      BEGIN 
+        FOR r IN (SELECT trigger_name, event_object_table 
+                  FROM information_schema.triggers 
+                  WHERE trigger_name LIKE 'sync_%_to_shadow_trigger') 
+        LOOP 
+          EXECUTE 'DROP TRIGGER IF EXISTS ' || r.trigger_name || ' ON public.' || r.event_object_table;
+        END LOOP; 
+      END $$;
+    `);
+    console.log('✅ Existing sync triggers cleaned up');
+
+    // Load test data first
+    await sourceLoader.loadTestData();
+    await destLoader.loadTestData();
+
+    // Modify source data to test that it gets migrated properly
+    console.log('🔧 Modifying source data to test migration...');
+    console.log('🔧 DEBUG: About to modify source data!');
+
+    // Modify a NON-PRESERVED table (Municipality) to test source data migration
+    await sourceLoader.executeQuery(`
+      UPDATE "Municipality" 
+      SET incorporated_place_name = CASE 
+        WHEN incorporated_place_name LIKE '%City%' THEN incorporated_place_name || ' Modified'
+        ELSE incorporated_place_name || ' Updated'
+      END,
+      slug = slug || '_modified'
+      WHERE gid IN (1, 2)
+    `);
+    console.log('✅ Source data modified for migration testing');
+    console.log('🔧 DEBUG: Source data modification completed!');
+
+    // Debug: Verify source data modification worked
+    const modifiedSourceMunicipalities = await sourceLoader.executeQuery(`
+      SELECT * FROM "Municipality" WHERE gid IN (1, 2) ORDER BY gid
+    `);
+    console.log(
+      '🔍 Source municipalities after modification:',
+      modifiedSourceMunicipalities.map(m => ({
+        gid: m.gid,
+        incorporated_place_name: m.incorporated_place_name,
+        slug: m.slug,
+      }))
+    );
+
+    // Ensure changes are committed by forcing a new connection/transaction
+    await sourceLoader.disconnect();
+    await sourceLoader.connect();
+
+    // Verify modification persisted across connection
+    const persistedSourceMunicipalities = await sourceLoader.executeQuery(`
+      SELECT * FROM "Municipality" WHERE gid IN (1, 2) ORDER BY gid
+    `);
+    console.log(
+      '🔍 Source municipalities after reconnection:',
+      persistedSourceMunicipalities.map(m => ({
+        gid: m.gid,
+        incorporated_place_name: m.incorporated_place_name,
+        slug: m.slug,
+      }))
+    );
+
+    // TES schema supports preserved tables: ['User', 'Scenario', 'BlockgroupOnScenario']
+    const preservedTables = ['User', 'Scenario', 'BlockgroupOnScenario'];
+
+    // Get database configuration for creating migrator
+    const sourceConfig = parseDatabaseUrl(expectedSourceUrl);
+    const destConfig = parseDatabaseUrl(expectedDestUrl);
+
+    // Step 1: Set up preserved table test data using existing fixture IDs
+    console.log('📝 Setting up preserved table test data...');
+
+    // Add some initial User data to destination (these should be preserved)
+    await destLoader.executeQuery(`
+      INSERT INTO "User" (id, name, email, "createdAt", "updatedAt") 
+      VALUES 
+        (100, 'Preserved User 1', 'preserved1@example.com', NOW(), NOW()),
+        (101, 'Preserved User 2', 'preserved2@example.com', NOW(), NOW())
+    `);
+
+    // For scenarios, instead of adding new ones, we'll modify existing ones after prepare
+    // This avoids foreign key issues during sync setup
+
+    // Add BlockgroupOnScenario data using existing scenario IDs (1-4 from fixture)
+    await destLoader.executeQuery(`
+      INSERT INTO "BlockgroupOnScenario" ("scenarioId", "blockgroupId")
+      VALUES 
+        (1, '484530004001'),
+        (2, '484530004001')
+    `);
+
+    console.log('✅ Preserved table test data setup completed');
+
+    // Verify initial preserved data counts
+    const initialPreservedUserCount = await destLoader.executeQuery(`
+      SELECT COUNT(*) as count FROM "User" WHERE id >= 100
+    `);
+    expect(parseInt(initialPreservedUserCount[0].count)).toBe(2);
+
+    // Step 2: Run prepareMigration with preserved tables
+    console.log('🔧 Running prepareMigration with preserved tables...');
+
+    // Create migrator AFTER source data modification to ensure it sees the modified state
+    const migrator = new DatabaseMigrator(sourceConfig, destConfig, preservedTables);
+
+    // Debug: Check source data right before prepare
+    const sourceUsersBeforePrepare = await sourceLoader.executeQuery(`
+      SELECT * FROM "User" WHERE id IN (1, 2) ORDER BY id
+    `);
+    console.log(
+      '🔍 Source users RIGHT BEFORE prepare:',
+      sourceUsersBeforePrepare.map(u => ({ id: u.id, name: u.name, email: u.email }))
+    );
+
+    const prepareResult = await migrator.prepareMigration();
+
+    expect(prepareResult.success).toBe(true);
+    expect(prepareResult.migrationId).toBeDefined();
+    expect(prepareResult.timestamp).toBeDefined();
+    console.log(`✅ Preparation completed with migration ID: ${prepareResult.migrationId}`);
+
+    // Debug: Verify source data is still modified after prepare
+    const sourceMunicipalitiesAfterPrepare = await sourceLoader.executeQuery(`
+      SELECT * FROM "Municipality" WHERE gid IN (1, 2) ORDER BY gid
+    `);
+    console.log(
+      '🔍 Source municipalities after prepare phase:',
+      sourceMunicipalitiesAfterPrepare.map(m => ({
+        gid: m.gid,
+        incorporated_place_name: m.incorporated_place_name,
+        slug: m.slug,
+      }))
+    );
+
+    // Step 3: Verify shadow schema exists and contains source data + preserved data
+    console.log('🔍 Verifying shadow schema and preserved data sync...');
+    const shadowSchemaCheck = await destLoader.executeQuery(`
+      SELECT schema_name FROM information_schema.schemata WHERE schema_name = 'shadow'
+    `);
+    expect(shadowSchemaCheck).toHaveLength(1);
+
+    // Verify source data was copied to shadow
+    const shadowUserCount = await destLoader.executeQuery(`
+      SELECT COUNT(*) as count FROM shadow."User"
+    `);
+    expect(parseInt(shadowUserCount[0].count)).toBe(6); // 4 from source + 2 preserved
+
+    // Debug: Check what source data was actually copied to shadow
+    const shadowSourceMunicipalities = await destLoader.executeQuery(`
+      SELECT * FROM shadow."Municipality" WHERE gid IN (1, 2) ORDER BY gid
+    `);
+    console.log(
+      '🔍 Source municipalities in shadow schema:',
+      shadowSourceMunicipalities.map(m => ({
+        gid: m.gid,
+        incorporated_place_name: m.incorporated_place_name,
+        slug: m.slug,
+      }))
+    );
+
+    // Verify preserved data is in shadow schema
+    const shadowPreservedUsers = await destLoader.executeQuery(`
+      SELECT * FROM shadow."User" WHERE id >= 100 ORDER BY id
+    `);
+    expect(shadowPreservedUsers).toHaveLength(2);
+    expect(shadowPreservedUsers[0].name).toBe('Preserved User 1');
+    expect(shadowPreservedUsers[1].name).toBe('Preserved User 2');
+
+    // Step 4: Test sync functionality - modify preserved data after prepare
+    console.log('🔄 Testing preserved table sync after prepare...');
+
+    // Test 1: Modify preserved User data and verify immediate sync
+    console.log('🔄 Modifying preserved User data...');
+    await destLoader.executeQuery(`
+      UPDATE "User" 
+      SET name = 'Modified Preserved User 1', "updatedAt" = NOW() 
+      WHERE id = 100
+    `);
+
+    // Verify immediate sync to shadow
+    const syncedUser = await destLoader.executeQuery(`
+      SELECT * FROM shadow."User" WHERE id = 100
+    `);
+    expect(syncedUser).toHaveLength(1);
+    expect(syncedUser[0].name).toBe('Modified Preserved User 1');
+    console.log('✅ User modification synced to shadow');
+
+    // Test 2: Add new preserved User and verify immediate sync
+    console.log('🔄 Adding new preserved User...');
+    await destLoader.executeQuery(`
+      INSERT INTO "User" (id, name, email, "createdAt", "updatedAt") 
+      VALUES (102, 'New Preserved User', 'new.preserved@example.com', NOW(), NOW())
+    `);
+
+    // Verify immediate sync to shadow
+    const syncedNewUser = await destLoader.executeQuery(`
+      SELECT * FROM shadow."User" WHERE id = 102
+    `);
+    expect(syncedNewUser).toHaveLength(1);
+    expect(syncedNewUser[0].name).toBe('New Preserved User');
+    console.log('✅ New User addition synced to shadow');
+
+    // Test 3: Modify existing Scenario data and verify immediate sync
+    console.log('🔄 Modifying preserved Scenario data...');
+    await destLoader.executeQuery(`
+      UPDATE "Scenario" 
+      SET name = 'Modified Scenario 1', "updatedAt" = NOW() 
+      WHERE id = 1
+    `);
+
+    // Verify immediate sync to shadow
+    const syncedScenario = await destLoader.executeQuery(`
+      SELECT * FROM shadow."Scenario" WHERE id = 1
+    `);
+    expect(syncedScenario).toHaveLength(1);
+    expect(syncedScenario[0].name).toBe('Modified Scenario 1');
+    console.log('✅ Scenario modification synced to shadow');
+
+    // Test 4: Add new BlockgroupOnScenario and verify immediate sync
+    console.log('🔄 Adding new BlockgroupOnScenario relationship...');
+    await destLoader.executeQuery(`
+      INSERT INTO "BlockgroupOnScenario" ("scenarioId", "blockgroupId")
+      VALUES (1, '110010003001')
+    `);
+
+    // Verify immediate sync to shadow
+    const syncedBlockgroupOnScenario = await destLoader.executeQuery(`
+      SELECT COUNT(*) as count FROM shadow."BlockgroupOnScenario" WHERE "scenarioId" = 1
+    `);
+    expect(parseInt(syncedBlockgroupOnScenario[0].count)).toBe(3); // Source fixture + preserved setup + new addition
+    console.log('✅ BlockgroupOnScenario addition synced to shadow');
+
+    console.log('✅ All preserved data modifications and sync verifications completed');
+
+    // Step 6: Create new migrator instance (test state persistence)
+    console.log('🔄 Creating new migrator instance to test state persistence...');
+    const newMigrator = new DatabaseMigrator(sourceConfig, destConfig, preservedTables);
+
+    // Step 7: Run completeMigration with preserved tables
+    console.log('🔧 Running completeMigration with preserved tables...');
+    const completeResult = await newMigrator.completeMigration(preservedTables);
+
+    expect(completeResult.success).toBe(true);
+    console.log('✅ Migration swap completed successfully');
+
+    // Verify final data integrity and preserved data sync
+    console.log('🔍 Verifying final data integrity...');
+
+    // Verify source data was migrated (modified TES data)
+    // Verify migrated source data from non-preserved tables contains modifications
+    const finalMunicipalities = await destLoader.executeQuery(
+      'SELECT * FROM "Municipality" WHERE gid IN (1, 2) ORDER BY gid'
+    );
+    expect(finalMunicipalities).toHaveLength(2);
+
+    // Check that the source data modifications are preserved in migration
+    expect(finalMunicipalities[0].slug).toContain('_modified');
+    expect(finalMunicipalities[0].incorporated_place_name).toMatch(/(Modified|Updated)$/);
+    expect(finalMunicipalities[1].slug).toContain('_modified');
+    expect(finalMunicipalities[1].incorporated_place_name).toMatch(/(Modified|Updated)$/);
+
+    console.log(
+      '🔍 Final migrated municipalities:',
+      finalMunicipalities.map(m => ({
+        gid: m.gid,
+        incorporated_place_name: m.incorporated_place_name,
+        slug: m.slug,
+      }))
+    );
+
+    // Verify preserved table data (User) was maintained from destination, not overwritten by source
+    const finalUsers = await destLoader.executeQuery('SELECT * FROM "User" ORDER BY id');
+    expect(finalUsers).toHaveLength(7); // 4 original + 3 preserved (including new one)
+
+    // Verify preserved data was maintained from destination (should NOT have source modifications)
+    const preservedUsers = finalUsers.filter(
+      (user: Record<string, unknown>) => (user.id as number) >= 100
+    );
+    expect(preservedUsers).toHaveLength(3);
+    expect(preservedUsers[0].name).toBe('Modified Preserved User 1'); // Modified version
+    expect(preservedUsers[1].name).toBe('Preserved User 2'); // Original
+    expect(preservedUsers[2].name).toBe('New Preserved User'); // Added after prepare
+
+    // Verify Scenarios were preserved and source scenarios modified
+    const finalScenarios = await destLoader.executeQuery('SELECT * FROM "Scenario" ORDER BY id');
+    expect(finalScenarios).toHaveLength(4); // 4 from source (one modified)
+    const modifiedScenario = finalScenarios.find((s: Record<string, unknown>) => s.id === 1);
+    expect(modifiedScenario.name).toBe('Modified Scenario 1'); // Our modification preserved
+
+    // Verify BlockgroupOnScenario relationships were preserved
+    const finalBlockgroupOnScenario = await destLoader.executeQuery(
+      'SELECT * FROM "BlockgroupOnScenario" ORDER BY "scenarioId", "blockgroupId"'
+    );
+    expect(finalBlockgroupOnScenario.length).toBeGreaterThanOrEqual(6); // At least original + added
+    const scenario1Relations = finalBlockgroupOnScenario.filter(
+      (rel: Record<string, unknown>) => (rel.scenarioId as number) === 1
+    );
+    expect(scenario1Relations).toHaveLength(3); // Source fixture + preserved setup + added after prepare
+
+    console.log('✅ Source data migration and preserved data verified');
+
+    // Verify backup schema exists
+    const backupSchemas = await destLoader.executeQuery(`
+      SELECT schema_name FROM information_schema.schemata 
+      WHERE schema_name LIKE 'backup_%'
+      ORDER BY schema_name DESC
+    `);
+    expect(backupSchemas.length).toBeGreaterThan(0);
+    console.log(`✅ Backup schema created: ${backupSchemas[0].schema_name}`);
+
+    // Verify shadow schema exists but is empty (ready for future migrations)
+    const finalShadowCheck = await destLoader.executeQuery(`
+      SELECT schema_name FROM information_schema.schemata WHERE schema_name = 'shadow'
+    `);
+    expect(finalShadowCheck).toHaveLength(1);
+
+    // Verify shadow schema is empty
+    const shadowTables = await destLoader.executeQuery(`
+      SELECT table_name FROM information_schema.tables WHERE table_schema = 'shadow'
+    `);
+    expect(shadowTables).toHaveLength(0);
+    console.log('✅ Shadow schema exists and is empty, ready for future migrations');
+
+    console.log(
+      '✅ Comprehensive two-phase migration with preserved tables test completed successfully'
+    );
+  }, 180000); // Extended timeout for comprehensive test with sync
 
   it('should perform TES rollback and verify original geometry restoration with PostGIS coordinate verification', async () => {
     // This test specifically validates that after rollback:

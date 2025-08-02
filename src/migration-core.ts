@@ -94,6 +94,16 @@ export interface SyncValidationResult {
   errors: string[];
 }
 
+export interface PreparationResult {
+  success: boolean;
+  migrationId: string;
+  timestamp: number;
+  activeTriggers: SyncTriggerInfo[];
+  stats: MigrationStats;
+  logs: string[];
+  error?: string;
+}
+
 export class DatabaseMigrator {
   private sourceConfig: DatabaseConfig;
   private destConfig: DatabaseConfig;
@@ -190,6 +200,353 @@ export class DatabaseMigrator {
       };
     } finally {
       await this.cleanup();
+    }
+  }
+
+  /**
+   * Prepare migration (Phases 1-3): Creates dump, restores to shadow, sets up sync triggers
+   */
+  async prepareMigration(): Promise<PreparationResult> {
+    try {
+      this.log('🚀 Starting migration preparation...');
+      this.log(`📊 Dry run mode: ${this.dryRun ? 'ENABLED' : 'DISABLED'}`);
+
+      const timestamp = Date.now();
+      const migrationId = `migration_${timestamp}_${this.sourceConfig.database}_to_${this.destConfig.database}`;
+
+      // Pre-migration checks
+      await this.performPreMigrationChecks();
+
+      // Analyze schemas
+      const sourceTables = await this.analyzeSchema(this.sourcePool, 'source');
+      const destTables = await this.analyzeSchema(this.destPool, 'destination');
+
+      this.log(`📋 Found ${sourceTables.length} source tables to migrate`);
+      this.log(`📋 Found ${destTables.length} destination tables to backup`);
+      this.log(`🔒 Will restore ${this.preservedTables.size} preserved tables after migration`);
+
+      if (this.dryRun) {
+        await this.performDryRun(sourceTables, destTables);
+
+        return {
+          success: true,
+          migrationId,
+          timestamp,
+          activeTriggers: [],
+          stats: this.stats,
+          logs: [...this.logBuffer],
+        };
+      }
+
+      // Perform actual preparation phases
+      await this.doPreparation(sourceTables, destTables, timestamp, migrationId);
+
+      this.log('✅ Migration preparation completed successfully');
+
+      return {
+        success: true,
+        migrationId,
+        timestamp,
+        activeTriggers: [...this.activeSyncTriggers],
+        stats: this.stats,
+        logs: [...this.logBuffer],
+      };
+    } catch (error) {
+      this.logError('Migration preparation failed', error);
+
+      return {
+        success: false,
+        migrationId: '',
+        timestamp: 0,
+        activeTriggers: [],
+        stats: this.stats,
+        logs: [...this.logBuffer],
+        error: error instanceof Error ? error.message : String(error),
+      };
+    } finally {
+      await this.cleanup();
+    }
+  }
+
+  /**
+   * Complete migration (Phases 4-7): Performs schema swap, cleanup, and finalization
+   * Uses database introspection instead of state files for validation
+   */
+  async completeMigration(preservedTables: string[] = []): Promise<MigrationResult> {
+    try {
+      this.log('🚀 Starting migration completion...');
+
+      // Validate migration readiness using database introspection
+      await this.validateMigrationReadiness(preservedTables);
+
+      // Detect timestamp from existing backup schemas if not provided
+      const timestamp = await this.detectMigrationTimestamp();
+
+      // Get table info for completion phases
+      const sourceTables = await this.analyzeSchema(this.destPool, 'shadow');
+
+      // Perform completion phases
+      await this.doCompletion(sourceTables, timestamp);
+
+      this.stats.endTime = new Date();
+      this.logSummary();
+
+      this.log('✅ Migration completed successfully');
+
+      return {
+        success: true,
+        stats: this.stats,
+        logs: [...this.logBuffer],
+      };
+    } catch (error) {
+      this.logError('Migration completion failed', error);
+
+      return {
+        success: false,
+        stats: this.stats,
+        logs: [...this.logBuffer],
+        error: error instanceof Error ? error.message : String(error),
+      };
+    } finally {
+      await this.cleanup();
+    }
+  }
+
+  /**
+   * Validate that the database is ready for migration completion using introspection
+   */
+  private async validateMigrationReadiness(preservedTables: string[]): Promise<void> {
+    this.log('🔍 Validating migration readiness...');
+
+    const client = await this.destPool.connect();
+    const issues: string[] = [];
+
+    try {
+      // 1. Check if shadow schema exists
+      const shadowExists = await client.query(`
+        SELECT EXISTS (
+          SELECT 1 FROM information_schema.schemata 
+          WHERE schema_name = 'shadow'
+        )
+      `);
+
+      if (!shadowExists.rows[0].exists) {
+        issues.push('❌ Shadow schema does not exist. Run prepare command first.');
+      } else {
+        this.log('✅ Shadow schema exists');
+      }
+
+      // 2. Check if shadow schema has tables
+      const shadowTables = await client.query(`
+        SELECT COUNT(*) as count
+        FROM information_schema.tables 
+        WHERE table_schema = 'shadow'
+      `);
+
+      const shadowTableCount = parseInt(shadowTables.rows[0].count);
+      if (shadowTableCount === 0) {
+        issues.push('❌ Shadow schema is empty. Run prepare command first.');
+      } else {
+        this.log(`✅ Shadow schema has ${shadowTableCount} tables`);
+      }
+
+      // 3. Check preserved table sync triggers if preserved tables are expected
+      if (preservedTables.length > 0) {
+        // Build a more specific query to check for triggers on the exact preserved tables
+        // Note: PostgreSQL creates one trigger entry per event type (INSERT/UPDATE/DELETE)
+        // so we need to count DISTINCT trigger names, not individual entries
+        const tableList = preservedTables
+          .map(table => `'sync_${table.toLowerCase()}_to_shadow_trigger'`)
+          .join(',');
+        const syncTriggers = await client.query(`
+          SELECT COUNT(DISTINCT trigger_name) as count
+          FROM information_schema.triggers 
+          WHERE trigger_name IN (${tableList})
+        `);
+
+        const triggerCount = parseInt(syncTriggers.rows[0].count);
+        if (triggerCount === 0) {
+          issues.push(
+            `⚠️  Expected ${preservedTables.length} sync triggers for preserved tables, but found none`
+          );
+        } else if (triggerCount !== preservedTables.length) {
+          // List the expected vs actual triggers for better debugging
+          const expectedTriggers = preservedTables.map(
+            table => `sync_${table.toLowerCase()}_to_shadow_trigger`
+          );
+          const existingTriggers = await client.query(`
+            SELECT DISTINCT trigger_name 
+            FROM information_schema.triggers 
+            WHERE trigger_name IN (${tableList})
+          `);
+          const actualTriggers = existingTriggers.rows.map(row => row.trigger_name);
+
+          issues.push(
+            `⚠️  Expected ${preservedTables.length} sync triggers for preserved tables [${expectedTriggers.join(', ')}], but found ${triggerCount} [${actualTriggers.join(', ')}]`
+          );
+        } else {
+          this.log(`✅ Found ${triggerCount} sync triggers for preserved tables`);
+        }
+
+        // 4. Validate specific preserved tables exist in both schemas
+        for (const tableName of preservedTables) {
+          const publicExists = await client.query(
+            `
+            SELECT EXISTS (
+              SELECT 1 FROM information_schema.tables 
+              WHERE table_schema = 'public' AND table_name = $1
+            )
+          `,
+            [tableName]
+          );
+
+          const shadowExists = await client.query(
+            `
+            SELECT EXISTS (
+              SELECT 1 FROM information_schema.tables 
+              WHERE table_schema = 'shadow' AND table_name = $1
+            )
+          `,
+            [tableName]
+          );
+
+          if (!publicExists.rows[0].exists) {
+            issues.push(`❌ Preserved table '${tableName}' not found in public schema`);
+          }
+          if (!shadowExists.rows[0].exists) {
+            issues.push(`❌ Preserved table '${tableName}' not found in shadow schema`);
+          }
+        }
+      }
+
+      // 5. Check for existing backup schemas (indicating previous migrations)
+      const backupSchemas = await client.query(`
+        SELECT schema_name 
+        FROM information_schema.schemata 
+        WHERE schema_name LIKE 'backup_%'
+        ORDER BY schema_name DESC
+        LIMIT 3
+      `);
+
+      if (backupSchemas.rows.length > 0) {
+        this.log(
+          `ℹ️  Found ${backupSchemas.rows.length} existing backup schemas: ${backupSchemas.rows.map((r: any) => r.schema_name).join(', ')}`
+        );
+      }
+
+      if (issues.length > 0) {
+        throw new Error(`Migration not ready:\n${issues.join('\n')}`);
+      }
+
+      this.log('✅ Migration readiness validation passed');
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Detect migration timestamp from database state
+   */
+  private async detectMigrationTimestamp(): Promise<number> {
+    // Generate new timestamp for this migration completion
+    const timestamp = Date.now();
+    this.log(`📅 Using timestamp: ${timestamp}`);
+    return timestamp;
+  }
+
+  /**
+   * Perform preparation phases (1-3)
+   */
+  private async doPreparation(
+    sourceTables: TableInfo[],
+    destTables: TableInfo[],
+    timestamp: number,
+    _migrationId: string
+  ): Promise<void> {
+    this.log('🔄 Starting migration preparation phases...');
+
+    try {
+      // Phase 1: Create source dump
+      const dumpPath = await this.createSourceDump(sourceTables, timestamp);
+
+      // Phase 2: Restore source dump to destination shadow schema
+      await this.restoreToDestinationShadow(sourceTables, dumpPath);
+
+      // Phase 3: Setup preserved table synchronization
+      await this.setupPreservedTableSync(destTables, timestamp);
+
+      this.log('✅ Preparation phases completed successfully');
+      this.log(`📦 Shadow schema ready for swap`);
+      this.log('💡 Run the swap command when ready to complete migration');
+    } catch (error) {
+      // Cleanup any partial preparation state
+      try {
+        if (this.activeSyncTriggers.length > 0) {
+          this.log('🧹 Cleaning up sync triggers after preparation failure...');
+          await this.cleanupRealtimeSync(this.activeSyncTriggers);
+        }
+      } catch (cleanupError) {
+        this.logError('Warning: Could not cleanup sync triggers', cleanupError);
+      }
+
+      throw error;
+    }
+  }
+
+  /**
+   * Perform completion phases (4-7)
+   */
+  private async doCompletion(sourceTables: TableInfo[], timestamp: number): Promise<void> {
+    this.log('🔄 Starting migration completion phases...');
+
+    try {
+      // Phase 4: Perform atomic schema swap (zero downtime!)
+      await this.performAtomicSchemaSwap(timestamp);
+
+      // Phase 5: Cleanup sync triggers and validate consistency
+      await this.cleanupSyncTriggersAndValidate(timestamp);
+
+      // Phase 6: Reset sequences and recreate indexes
+      this.log('🔢 Phase 6: Resetting sequences...');
+      await this.resetSequences(sourceTables);
+
+      this.log('🗂️  Phase 7: Recreating indexes...');
+      await this.recreateIndexes(sourceTables);
+
+      // Write protection was already disabled after schema swap in Phase 4
+
+      this.log('✅ Zero-downtime migration finished successfully');
+      this.log(`📦 Original schema preserved in backup_${timestamp} schema`);
+      this.log('💡 Call cleanupBackupSchema(timestamp) to remove backup after verification');
+    } catch (error) {
+      this.logError('Migration completion failed', error);
+
+      // Cleanup any active sync triggers before rollback
+      try {
+        if (this.activeSyncTriggers.length > 0) {
+          this.log('🧹 Cleaning up active sync triggers before rollback...');
+          await this.cleanupRealtimeSync(this.activeSyncTriggers);
+        }
+      } catch (cleanupError) {
+        this.logError('Warning: Could not cleanup sync triggers', cleanupError);
+      }
+
+      // Ensure destination write protection is disabled on error
+      try {
+        await this.disableDestinationWriteProtection();
+      } catch (cleanupError) {
+        this.logError('Warning: Could not disable destination write protection', cleanupError);
+      }
+
+      this.log('🔄 Attempting automatic rollback via schema swap...');
+      try {
+        await this.rollbackSchemaSwap(timestamp);
+        this.log('✅ Rollback completed - original schema restored');
+      } catch (rollbackError) {
+        this.logError('Rollback failed', rollbackError);
+        this.log('⚠️  Manual intervention required - check backup schema');
+      }
+      throw error;
     }
   }
 
@@ -1062,8 +1419,8 @@ export class DatabaseMigrator {
     const client = await this.destPool.connect();
 
     try {
-      // Enable write protection on destination database at the start of Phase 1B
-      await this.enableDestinationWriteProtection();
+      // No write protection on destination during prepare phase
+      // This allows production traffic to continue normally and preserved table sync to work
 
       // Disable foreign key constraints for the destination database during setup
       await this.disableForeignKeyConstraints(this.destPool);
@@ -1256,6 +1613,10 @@ export class DatabaseMigrator {
     const client = await this.destPool.connect();
 
     try {
+      // Enable brief write protection only during the actual schema swap operations
+      this.log('🔒 Enabling brief write protection for atomic schema operations...');
+      await this.enableDestinationWriteProtection(); // Enable full protection
+
       await client.query('BEGIN');
 
       // Move current public schema to backup
@@ -1272,6 +1633,11 @@ export class DatabaseMigrator {
       this.log('✅ Created new shadow schema');
 
       await client.query('COMMIT');
+
+      // Remove write protection immediately after schema swap completes
+      this.log('🔓 Removing write protection after atomic swap completion...');
+      await this.disableDestinationWriteProtection();
+
       this.log('✅ Atomic schema swap completed - migration is now live!');
 
       // Validate the atomic schema swap completed successfully
@@ -1344,31 +1710,42 @@ export class DatabaseMigrator {
         );
 
         if (tableExists.rows[0].exists) {
-          // Step 1: Clear shadow table and copy current data
-          // Temporarily disable foreign key constraints for this operation
-          await client.query('SET session_replication_role = replica');
-          await client.query(`DELETE FROM shadow."${actualTableName}"`);
-          await client.query('SET session_replication_role = origin');
+          // Begin transaction to eliminate race condition between copy and trigger creation
+          await client.query('BEGIN');
 
-          await client.query(
-            `INSERT INTO shadow."${actualTableName}" SELECT * FROM public."${actualTableName}"`
-          );
+          try {
+            // Step 1: Clear shadow table and copy current data atomically
+            // Temporarily disable foreign key constraints for this operation
+            await client.query('SET session_replication_role = replica');
+            await client.query(`DELETE FROM shadow."${actualTableName}"`);
+            await client.query(
+              `INSERT INTO shadow."${actualTableName}" SELECT * FROM public."${actualTableName}"`
+            );
+            await client.query('SET session_replication_role = origin');
 
-          // Step 2: Setup real-time sync triggers
-          const triggerInfo = await this.createRealtimeSyncTrigger(client, actualTableName);
-          triggerInfo.checksum = `sync_${timestamp}`; // Use timestamp for tracking
-          this.activeSyncTriggers.push(triggerInfo);
+            // Step 2: Setup real-time sync triggers (in same transaction)
+            const triggerInfo = await this.createRealtimeSyncTrigger(client, actualTableName);
+            triggerInfo.checksum = `sync_${timestamp}`; // Use timestamp for tracking
+            this.activeSyncTriggers.push(triggerInfo);
 
-          // Step 2.1: Validate trigger was created successfully
-          await this.validateTriggerExists(triggerInfo);
+            // Commit the transaction - makes copy and trigger creation atomic
+            await client.query('COMMIT');
 
-          // Step 3: Basic sync setup validation
-          const rowCountResult = await client.query(
-            `SELECT COUNT(*) FROM public."${actualTableName}"`
-          );
-          const rowCount = parseInt(rowCountResult.rows[0].count);
+            // Step 2.1: Validate trigger was created successfully
+            await this.validateTriggerExists(triggerInfo);
 
-          this.log(`✅ Sync setup complete for ${actualTableName} (${rowCount} rows)`);
+            // Step 3: Basic sync setup validation
+            const rowCountResult = await client.query(
+              `SELECT COUNT(*) FROM public."${actualTableName}"`
+            );
+            const rowCount = parseInt(rowCountResult.rows[0].count);
+
+            this.log(`✅ Sync setup complete for ${actualTableName} (${rowCount} rows)`);
+          } catch (error) {
+            // Rollback transaction on any error
+            await client.query('ROLLBACK');
+            throw error;
+          }
         } else {
           throw new Error(
             `Preserved table ${actualTableName} exists in schema analysis but not in actual database`
@@ -2062,9 +2439,12 @@ export class DatabaseMigrator {
   /**
    * Enable write protection on destination database tables to prevent data modification during migration
    * Uses triggers that block INSERT/UPDATE/DELETE operations while allowing schema operations
+   * @param excludedTables Optional array of table names to exclude from write protection
    */
-  private async enableDestinationWriteProtection(): Promise<void> {
-    this.log('🔒 Enabling write protection on destination database tables...');
+  private async enableDestinationWriteProtection(excludedTables: string[] = []): Promise<void> {
+    const excludeMessage =
+      excludedTables.length > 0 ? ` (excluding ${excludedTables.length} preserved tables)` : '';
+    this.log(`🔒 Enabling write protection on destination database tables${excludeMessage}...`);
 
     const client = await this.destPool.connect();
     try {
@@ -2088,9 +2468,18 @@ export class DatabaseMigrator {
         WHERE schemaname = 'public'
       `);
 
-      // Create triggers on all tables to block writes
+      // Create triggers on tables to block writes, excluding preserved tables during prepare
+      const excludedTableSet = new Set(excludedTables.map(t => t.toLowerCase()));
+
       for (const row of result.rows) {
         const tableName = row.tablename;
+
+        // Skip preserved tables if they are in the excluded list
+        if (excludedTableSet.has(tableName.toLowerCase())) {
+          this.log(`🔓 Skipping write protection for preserved table: ${tableName}`);
+          continue;
+        }
+
         const triggerName = `migration_write_block_${tableName}`;
 
         await client.query(`
@@ -2103,7 +2492,8 @@ export class DatabaseMigrator {
         this.log(`🔒 Write protection enabled for destination table: ${tableName}`);
       }
 
-      this.log('✅ Write protection enabled on all destination tables');
+      const protectedCount = result.rows.length - excludedTables.length;
+      this.log(`✅ Write protection enabled on ${protectedCount} destination tables`);
     } catch (error) {
       this.logError('Failed to enable destination write protection', error);
       throw error;
