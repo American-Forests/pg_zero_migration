@@ -646,18 +646,16 @@ export class DatabaseMigrator {
     this.log(`   3. 🔄 Restore source data to destination shadow schema`);
     if (this.preservedTables.size > 0) {
       this.log(`   4. 🔄 Setup real-time sync for ${this.preservedTables.size} preserved tables`);
-      this.log(`   5. 💾 Backup preserved table data for rollback safety`);
     } else {
       this.log(`   4. ⏭️  No preserved tables to sync`);
-      this.log(`   5. ⏭️  No preserved table backup needed`);
     }
-    this.log(`   6. ⚡ Perform atomic schema swap (zero downtime!)`);
-    this.log(`   7. 🧹 Cleanup sync triggers and validate consistency`);
+    this.log(`   5. ⚡ Perform atomic schema swap (zero downtime!)`);
+    this.log(`   6. 🧹 Cleanup sync triggers and validate consistency`);
     this.log(
-      `   8. 🔢 Reset sequences for ${sourceTables.filter(t => t.sequences.length > 0).length} tables`
+      `   7. 🔢 Reset sequences for ${sourceTables.filter(t => t.sequences.length > 0).length} tables`
     );
     this.log(
-      `   9. 🗂️  Recreate ${sourceTables.reduce((acc, t) => acc + t.indexes.length, 0)} indexes`
+      `   8. 🗂️  Recreate ${sourceTables.reduce((acc, t) => acc + t.indexes.length, 0)} indexes`
     );
     this.log(`  10. 🔓 Remove write protection and complete migration`);
 
@@ -731,20 +729,17 @@ export class DatabaseMigrator {
       // Phase 3: Setup preserved table synchronization
       await this.setupPreservedTableSync(destTables, timestamp);
 
-      // Phase 4: Backup preserved table data (for rollback safety)
-      await this.backupPreservedTableData(destTables, timestamp);
-
-      // Phase 5: Perform atomic schema swap (zero downtime!)
+      // Phase 4: Perform atomic schema swap (zero downtime!)
       await this.performAtomicSchemaSwap(timestamp);
 
-      // Phase 6: Cleanup sync triggers and validate consistency
+      // Phase 5: Cleanup sync triggers and validate consistency
       await this.cleanupSyncTriggersAndValidate(timestamp);
 
-      // Phase 7: Reset sequences and recreate indexes
-      this.log('🔢 Phase 7: Resetting sequences...');
+      // Phase 6: Reset sequences and recreate indexes
+      this.log('🔢 Phase 6: Resetting sequences...');
       await this.resetSequences(sourceTables);
 
-      this.log('🗂️  Phase 8: Recreating indexes...');
+      this.log('🗂️  Phase 7: Recreating indexes...');
       await this.recreateIndexes(sourceTables);
 
       // Disable destination write protection after all critical phases complete
@@ -1015,73 +1010,10 @@ export class DatabaseMigrator {
   }
 
   /**
-   * Phase 4: Backup preserved table data before schema swap
-   */
-  private async backupPreservedTableData(
-    destTables: TableInfo[],
-    timestamp: number
-  ): Promise<void> {
-    if (this.preservedTables.size === 0) {
-      this.log('✅ No preserved tables to backup');
-      return;
-    }
-
-    this.log('💾 Phase 4: Backing up preserved table data...');
-
-    const client = await this.destPool.connect();
-
-    try {
-      await client.query('BEGIN');
-
-      for (const tableName of this.preservedTables) {
-        const backupTableName = `${tableName}_backup_${timestamp}`;
-
-        try {
-          // Check if table exists (handle case-sensitive table names)
-          const tableExists = await client.query(
-            `
-            SELECT EXISTS (
-              SELECT 1 FROM information_schema.tables 
-              WHERE table_schema = 'public' 
-              AND table_name = $1
-            )
-          `,
-            [tableName]
-          );
-
-          if (tableExists.rows[0].exists) {
-            this.log(`💾 Backing up preserved table: ${tableName} → ${backupTableName}`);
-
-            // Create backup table with same structure
-            await client.query(`CREATE TABLE "${backupTableName}" AS SELECT * FROM "${tableName}"`);
-
-            const countResult = await client.query(`SELECT COUNT(*) FROM "${backupTableName}"`);
-            const rowCount = parseInt(countResult.rows[0].count);
-            this.log(`📊 Backed up ${rowCount} rows from ${tableName}`);
-          } else {
-            this.log(`⚠️  Table ${tableName} not found, skipping backup`);
-          }
-        } catch (error) {
-          const errorMessage = error instanceof Error ? error.message : String(error);
-          this.log(`⚠️  Warning: Could not backup ${tableName}: ${errorMessage}`);
-        }
-      }
-
-      await client.query('COMMIT');
-      this.log('✅ Preserved table data backed up');
-    } catch (error) {
-      await client.query('ROLLBACK');
-      throw new Error(`Failed to backup preserved table data: ${error}`);
-    } finally {
-      client.release();
-    }
-  }
-
-  /**
-   * Phase 5: Perform atomic schema swap
+   * Phase 4: Perform atomic schema swap
    */
   private async performAtomicSchemaSwap(timestamp: number): Promise<void> {
-    this.log('🔄 Phase 5: Performing atomic schema swap...');
+    this.log('🔄 Phase 4: Performing atomic schema swap...');
 
     const client = await this.destPool.connect();
 
@@ -1519,26 +1451,6 @@ export class DatabaseMigrator {
         this.log(`🗑️  Cleaned up backup schema: ${backupSchemaName}`);
       } else {
         this.log(`⚠️  Backup schema ${backupSchemaName} not found`);
-      }
-
-      // Also clean up any backup tables from preserved table operations
-      const backupTables = await client.query(`
-        SELECT table_name 
-        FROM information_schema.tables 
-        WHERE table_schema = 'public' 
-        AND table_name LIKE '%_backup_${timestamp}'
-      `);
-
-      for (const row of backupTables.rows) {
-        try {
-          await client.query(`DROP TABLE "${row.table_name}" CASCADE;`);
-          this.log(`🗑️  Cleaned up backup table: ${row.table_name}`);
-        } catch (error) {
-          const errorMessage = error instanceof Error ? error.message : String(error);
-          this.log(
-            `⚠️  Warning: Could not clean up backup table ${row.table_name}: ${errorMessage}`
-          );
-        }
       }
 
       this.log('✅ Backup cleanup completed');

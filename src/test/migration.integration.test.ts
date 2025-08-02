@@ -677,21 +677,6 @@ describe('TES Schema Migration Integration Tests', () => {
     const backupTableNames = backupTables.map((row: { table_name: string }) => row.table_name);
     console.log(`📊 Backup schema tables (${backupTableNames.length}):`, backupTableNames);
 
-    // Also get the temporary backup tables created for preserved tables during migration
-    const preservedBackupTables = await destLoader.executeQuery(`
-      SELECT table_name FROM information_schema.tables 
-      WHERE table_schema = '${backupSchema}' 
-        AND table_type = 'BASE TABLE'
-        AND table_name LIKE '%_backup_%'
-      ORDER BY table_name
-    `);
-    if (preservedBackupTables.length > 0) {
-      console.log(
-        `📦 Preserved table backup tables (${preservedBackupTables.length}):`,
-        preservedBackupTables.map((row: { table_name: string }) => row.table_name)
-      );
-    }
-
     // Check table count difference and provide detailed logging if mismatch
     if (backupTables.length !== destTablesBefore.length) {
       console.log('⚠️  Table count mismatch detected!');

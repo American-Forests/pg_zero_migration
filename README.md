@@ -37,28 +37,23 @@ The migration process follows a carefully orchestrated 8-phase approach:
 2. **Real-time Sync Setup**: Creates triggers for real-time synchronization of preserved tables
 3. **Initial Sync**: Copies current preserved table data to shadow schema
 
-### Phase 4: Backup Preserved Table Data
-
-1. **Preserved Table Backup**: Backs up any tables marked for preservation before schema swap
-2. **Backup Validation**: Verifies backup data integrity
-
-### Phase 5: Perform Atomic Schema Swap
+### Phase 4: Perform Atomic Schema Swap
 
 1. **Backup Creation**: Moves current public schema to timestamped backup schema
 2. **Schema Activation**: Promotes shadow schema to become the new public schema  
 3. **New Shadow Creation**: Creates fresh shadow schema for future migrations
 
-### Phase 6: Cleanup Sync Triggers and Validate Consistency
+### Phase 5: Cleanup Sync Triggers and Validate Consistency
 
 1. **Trigger Cleanup**: Removes real-time sync triggers from preserved tables
 2. **Data Validation**: Validates consistency between migrated data
 
-### Phase 7: Reset Sequences
+### Phase 6: Reset Sequences
 
 1. **Sequence Synchronization**: Synchronizes all sequence values to match source database
 2. **Sequence Validation**: Verifies sequence values are correctly set
 
-### Phase 8: Recreate Indexes
+### Phase 7: Recreate Indexes
 
 1. **Index Recreation**: Rebuilds indexes for optimal performance
 2. **Spatial Index Handling**: Special handling for PostGIS spatial indexes
