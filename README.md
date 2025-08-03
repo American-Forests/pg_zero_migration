@@ -6,9 +6,9 @@ A zero-downtime PostgreSQL database migration tool with parallel processing capa
 
 The Database Migration Tool provides enterprise-grade database migration capabilities with the following key features:
 
-- **Zero-downtime migrations** using atomic schema swapping
+- **Zero-downtime migrations** using atomic table swapping
 - **Parallel processing** with pg_restore for maximum performance  
-- **Shadow schema strategy** to minimize impact on production
+- **Shadow table strategy** to minimize impact on production
 - **Comprehensive data integrity verification**
 - **Rollback capabilities** with automatic backup creation
 - **Foreign key constraint management**
@@ -22,26 +22,25 @@ The migration process follows a carefully orchestrated 8-phase approach:
 
 ### Phase 1: Create Source Dump
 
-1. **Source Preparation**: Source database tables are temporarily made read-only and moved from `public` to `shadow` schema.  This is necessary for dump to be restored to shadow in destination
+1. **Source Preparation**: Source database is temporarily made read-only during dump creation for consistency
 2. **Binary Dump Creation**: Creates a high-performance binary dump using `pg_dump`
-3. **Source Restoration**: Restores source database tables back to public schema
 
-### Phase 2: Restore Source Dump to Destination Shadow Schema
+### Phase 2: Create Shadow Tables in Destination Public Schema
 
-1. **Destination Setup**: Drops existing shadow schema on destination and disables foreign key constraints
-2. **Parallel Restoration**: Uses `pg_restore` with multiple parallel jobs to restore data to shadow schema
+1. **Destination Setup**: Cleans up existing shadow tables and disables foreign key constraints
+2. **Parallel Restoration**: Uses `pg_restore` with multiple parallel jobs to restore data as shadow tables with "shadow_" prefix
 
 ### Phase 3: Setup Preserved Table Synchronization
 
 1. **Preserved Table Validation**: Validates that preserved tables exist in destination schema
-2. **Real-time Sync Setup**: Creates triggers for real-time synchronization of preserved tables to shadow ensuring up to date right until schema swap
-3. **Initial Sync**: Copies current preserved table data to shadow schema
+2. **Real-time Sync Setup**: Creates triggers for real-time synchronization of preserved tables to shadow tables ensuring up to date right until table swap
+3. **Initial Sync**: Copies current preserved table data to shadow tables
 
-### Phase 4: Perform Atomic Schema Swap
+### Phase 4: Perform Atomic Table Swap
 
-1. **Backup Creation**: Moves current public schema to timestamped backup schema
-2. **Schema Activation**: Promotes shadow schema to become the new public schema  
-3. **New Shadow Creation**: Creates fresh shadow schema for future migrations
+1. **Backup Creation**: Renames current tables to "backup_" prefix
+2. **Table Activation**: Renames shadow tables to become the new active tables
+3. **Atomic Transaction**: All table renames happen in a single transaction with deferred constraints
 
 ### Phase 5: Cleanup Sync Triggers and Validate Consistency
 
@@ -63,11 +62,11 @@ The migration process follows a carefully orchestrated 8-phase approach:
 
 The migration tool implements multiple layers of protection to prevent overwhelming the destination database during restore operations:
 
-### Shadow Schema Isolation
+### Shadow Table Isolation
 
-- **Parallel Operations**: Data restore happens in an isolated `shadow` schema while the destination continues serving traffic from the `public` schema
+- **Parallel Operations**: Data restore happens in isolated shadow tables while the destination continues serving traffic from the active tables
 - **Resource Separation**: Restore operations consume separate database resources, preventing interference with destination queries
-- **Atomic Cutover**: The final schema swap is instantaneous using PostgreSQL's atomic `ALTER SCHEMA RENAME` operations
+- **Atomic Cutover**: The final table swap is instantaneous using PostgreSQL's atomic `ALTER TABLE RENAME` operations
 
 ### Connection Management
 
@@ -97,7 +96,7 @@ The migration tool implements multiple layers of protection to prevent overwhelm
 ### Destination Continuity
 
 - **Zero-Downtime Design**: Destination applications continue operating normally during the entire migration process
-- **Instant Activation**: New schema becomes active immediately via atomic operations (typically <100ms)
+- **Instant Activation**: New tables become active immediately via atomic operations (typically 40-80ms)
 - **Preserved Table Sync**: Critical tables can be kept synchronized in real-time during migration
 - **Rollback Capability**: Complete rollback to original state available if issues are detected
 
@@ -185,7 +184,7 @@ npm run migration -- swap \
 ```
 
 **What happens during swap:**
-- Performs atomic schema swap (typically <100ms downtime)
+- Performs atomic table swap (typically 40-80ms downtime)
 - Cleans up sync triggers
 - Resets sequences and recreates indexes
 - Validates migration completion

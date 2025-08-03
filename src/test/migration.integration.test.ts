@@ -165,6 +165,39 @@ describe('Database Migration Integration Tests', () => {
     await migrator.migrate();
     console.log('Migration completed successfully');
 
+    // ✅ CRITICAL VALIDATION: Verify write protection is properly disabled
+    console.log('🔒 Validating write protection is properly disabled...');
+
+    // Check source database for write protection artifacts
+    const sourceWriteProtectionCheck = await sourceLoader.executeQuery(`
+      SELECT 
+        (SELECT EXISTS (SELECT 1 FROM pg_proc WHERE proname = 'migration_block_writes')) as has_function,
+        (SELECT COUNT(*) FROM information_schema.triggers 
+         WHERE trigger_name LIKE 'migration_write_block_%' AND trigger_schema = 'public') as trigger_count
+    `);
+
+    const sourceHasFunction = sourceWriteProtectionCheck[0].has_function;
+    const sourceTriggerCount = parseInt(sourceWriteProtectionCheck[0].trigger_count);
+
+    expect(sourceHasFunction).toBe(false);
+    expect(sourceTriggerCount).toBe(0);
+
+    // Check destination database for write protection artifacts
+    const destWriteProtectionCheck = await destLoader.executeQuery(`
+      SELECT 
+        (SELECT EXISTS (SELECT 1 FROM pg_proc WHERE proname = 'migration_block_writes')) as has_function,
+        (SELECT COUNT(*) FROM information_schema.triggers 
+         WHERE trigger_name LIKE 'migration_write_block_%' AND trigger_schema = 'public') as trigger_count
+    `);
+
+    const destHasFunction = destWriteProtectionCheck[0].has_function;
+    const destTriggerCount = parseInt(destWriteProtectionCheck[0].trigger_count);
+
+    expect(destHasFunction).toBe(false);
+    expect(destTriggerCount).toBe(0);
+
+    console.log('✅ Write protection properly disabled on both source and destination');
+
     console.log('🔍 Performing additional atomic schema swap validation...');
 
     async function validateAtomicSchemaSwap(
@@ -215,19 +248,61 @@ describe('Database Migration Integration Tests', () => {
       console.log(`✅ Atomic schema swap validation passed for timestamp ${timestamp}`);
     }
 
-    // Get the migration timestamp from the migrator's backup schema
-    const backupSchemas = await destLoader.executeQuery(`
-      SELECT schema_name 
-      FROM information_schema.schemata 
-      WHERE schema_name LIKE 'backup_%'
-      ORDER BY schema_name DESC
+    async function validateAtomicTableSwap(loader: DbTestLoader, timestamp: number): Promise<void> {
+      // 1. Verify public schema exists and contains expected objects
+      const publicSchemaCheck = await loader.executeQuery(`
+        SELECT schema_name 
+        FROM information_schema.schemata 
+        WHERE schema_name = 'public'
+      `);
+      expect(publicSchemaCheck.length).toBeGreaterThan(0);
+
+      // 2. Verify backup tables exist with expected naming
+      const backupTablesCheck = await loader.executeQuery(`
+        SELECT table_name 
+        FROM information_schema.tables 
+        WHERE table_schema = 'public' 
+        AND table_name LIKE 'backup_%'
+      `);
+      expect(backupTablesCheck.length).toBeGreaterThan(0);
+
+      // 3. Verify no shadow tables remain (they should have been swapped)
+      const shadowTablesCheck = await loader.executeQuery(`
+        SELECT table_name 
+        FROM information_schema.tables 
+        WHERE table_schema = 'public' 
+        AND table_name LIKE 'shadow_%'
+      `);
+      expect(shadowTablesCheck.length).toBe(0);
+
+      // 4. Verify public schema has tables (not empty)
+      const publicTablesCheck = await loader.executeQuery(`
+        SELECT COUNT(*) as count 
+        FROM information_schema.tables 
+        WHERE table_schema = 'public' 
+        AND table_type = 'BASE TABLE'
+        AND table_name NOT LIKE 'backup_%'
+        AND table_name NOT LIKE 'shadow_%'
+      `);
+      expect(parseInt(publicTablesCheck[0].count)).toBeGreaterThan(0);
+
+      console.log(`✅ Atomic table swap validation passed for timestamp ${timestamp}`);
+    }
+
+    // Get the migration timestamp from the migrator's backup tables
+    const backupTables = await destLoader.executeQuery(`
+      SELECT table_name 
+      FROM information_schema.tables 
+      WHERE table_schema = 'public' 
+      AND table_name LIKE 'backup_%'
+      ORDER BY table_name DESC
       LIMIT 1
     `);
-    expect(backupSchemas.length).toBeGreaterThan(0);
+    expect(backupTables.length).toBeGreaterThan(0);
 
-    const backupSchemaName = backupSchemas[0].schema_name;
-    const timestamp = parseInt(backupSchemaName.replace('backup_', ''));
-    await validateAtomicSchemaSwap(destLoader, timestamp);
+    const backupTableName = backupTables[0].table_name;
+    const timestamp = parseInt(backupTableName.replace('backup_', '').split('_')[0]);
+    await validateAtomicTableSwap(destLoader, timestamp);
 
     console.log('✅ Additional atomic schema swap validation completed');
 
@@ -280,15 +355,22 @@ describe('Database Migration Integration Tests', () => {
     `);
     expect(shadowSchemaCheck).toHaveLength(0);
 
-    // Verify backup schema was created in destination database
-    console.log('Verifying backup schema creation in destination...');
-    const backupSchemaCheck = await destLoader.executeQuery(`
-      SELECT schema_name 
-      FROM information_schema.schemata 
-      WHERE schema_name LIKE 'backup_%'
+    // Verify backup tables were created in destination database
+    console.log('Verifying backup table creation in destination...');
+    const backupTablesCheck = await destLoader.executeQuery(`
+      SELECT table_name 
+      FROM information_schema.tables 
+      WHERE table_schema = 'public' 
+      AND table_name LIKE 'backup_%'
+      ORDER BY table_name
     `);
-    expect(backupSchemaCheck.length).toBeGreaterThan(0);
-    expect(backupSchemaCheck[0].schema_name).toMatch(/^backup_\d+$/);
+    expect(backupTablesCheck.length).toBeGreaterThan(0);
+    expect(backupTablesCheck.length).toBe(3); // Should have backup_User, backup_Post, backup_Comment
+    expect(backupTablesCheck.map(t => t.table_name).sort()).toEqual([
+      'backup_Comment',
+      'backup_Post',
+      'backup_User',
+    ]);
 
     // ✅ HIGH PRIORITY VALIDATION: Foreign Key Integrity Check (moved from migration-core.ts validateForeignKeyIntegrity)
     // This was previously performed during migration runtime, causing performance delays
