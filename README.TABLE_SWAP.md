@@ -2,7 +2,7 @@
 
 ## Executive Summary
 
-Replace the current schema-based migration system with a table-swap approach to improve migration reliability, performance, and maintainability.
+Rip and replace the current schema-based migration system with a table-swap approach.  Keep all the same features and tests and just get them to passing.
 
 ## Problem Statement
 

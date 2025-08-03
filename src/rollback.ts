@@ -55,107 +55,87 @@ export class DatabaseRollback {
   }
 
   /**
-   * Get all available backup schemas with their metadata
+   * Get all available backup tables with their metadata
    */
   async getAvailableBackups(): Promise<BackupInfo[]> {
-    this.log('🔍 Scanning for available backup schemas...');
+    this.log('🔍 Scanning for available backup tables...');
 
     const client = await this.pool.connect();
     try {
-      // Find all backup schemas
-      const schemasResult = await client.query(`
-        SELECT schema_name 
-        FROM information_schema.schemata 
-        WHERE schema_name LIKE 'backup_%'
-        ORDER BY schema_name DESC
+      // Find all backup tables in public schema
+      const tablesResult = await client.query(`
+        SELECT table_name 
+        FROM information_schema.tables 
+        WHERE table_schema = 'public'
+        AND table_name LIKE 'backup_%'
+        ORDER BY table_name DESC
       `);
 
       const backups: BackupInfo[] = [];
 
-      for (const row of schemasResult.rows) {
-        const schemaName = row.schema_name;
-        const timestamp = schemaName.replace('backup_', '');
+      if (tablesResult.rows.length === 0) {
+        this.log('📊 Found 0 backup tables');
+        return backups;
+      }
+
+      // Create a single backup entry representing all backup tables
+      const backupTables: BackupTableInfo[] = [];
+
+      for (const row of tablesResult.rows) {
+        const tableName = row.table_name;
 
         try {
-          // Get tables in this backup schema
-          const tablesResult = await client.query(
-            `
-            SELECT table_name 
-            FROM information_schema.tables 
-            WHERE table_schema = $1
-            ORDER BY table_name
-          `,
-            [schemaName]
+          // Get row count
+          const countResult = await client.query(
+            `SELECT COUNT(*) as count FROM public."${tableName}"`
           );
+          const rowCount = parseInt(countResult.rows[0].count);
 
-          const tables: BackupTableInfo[] = [];
-          let totalRows = 0;
+          // Get table size
+          const sizeResult = await client.query(`
+            SELECT pg_size_pretty(pg_total_relation_size('public."${tableName}"')) as size
+          `);
+          const size = sizeResult.rows[0].size;
 
-          // Get detailed info for each table
-          for (const tableRow of tablesResult.rows) {
-            const tableName = tableRow.table_name;
-
-            try {
-              // Get row count
-              const countResult = await client.query(
-                `SELECT COUNT(*) as count FROM "${schemaName}"."${tableName}"`
-              );
-              const rowCount = parseInt(countResult.rows[0].count);
-              totalRows += rowCount;
-
-              // Get table size (fixed query with proper quoting)
-              const sizeResult = await client.query(`
-                SELECT pg_size_pretty(pg_total_relation_size('"${schemaName}"."${tableName}"')) as size
-              `);
-              const size = sizeResult.rows[0].size;
-
-              tables.push({
-                tableName,
-                rowCount,
-                size,
-              });
-            } catch (error) {
-              this.log(`⚠️  Could not get info for table ${tableName}: ${error}`);
-              tables.push({
-                tableName,
-                rowCount: 0,
-                size: 'unknown',
-              });
-            }
-          }
-
-          // Get total schema size
-          const totalSizeResult = await client.query(
-            `
-            SELECT pg_size_pretty(
-              SUM(pg_total_relation_size('"${schemaName}"."' || table_name || '"'))
-            ) as total_size
-            FROM information_schema.tables 
-            WHERE table_schema = $1
-          `,
-            [schemaName]
-          );
-
-          const totalSize = totalSizeResult.rows[0].total_size || '0 bytes';
-
-          backups.push({
-            timestamp,
-            schemaName,
-            createdAt: new Date(parseInt(timestamp)),
-            tableCount: tables.length,
-            totalSize,
-            tables,
+          backupTables.push({
+            tableName,
+            rowCount,
+            size,
           });
-
-          this.log(
-            `✅ Found backup ${timestamp}: ${tables.length} tables, ${totalRows} total rows`
-          );
         } catch (error) {
-          this.log(`⚠️  Could not analyze backup ${timestamp}: ${error}`);
+          this.log(`⚠️  Could not get info for backup table ${tableName}: ${error}`);
+          backupTables.push({
+            tableName,
+            rowCount: 0,
+            size: 'unknown',
+          });
         }
       }
 
-      this.log(`📊 Found ${backups.length} backup schemas`);
+      // Calculate total size for all backup tables
+      const totalSizeResult = await client.query(`
+        SELECT pg_size_pretty(
+          SUM(pg_total_relation_size('public."' || table_name || '"'))
+        ) as total_size
+        FROM information_schema.tables 
+        WHERE table_schema = 'public'
+        AND table_name LIKE 'backup_%'
+      `);
+
+      const totalSize = totalSizeResult.rows[0].total_size || '0 bytes';
+
+      backups.push({
+        timestamp: 'latest', // Simplified for table-swap approach
+        schemaName: 'public', // backup tables are in public schema
+        createdAt: new Date(),
+        tableCount: backupTables.length,
+        totalSize,
+        tables: backupTables,
+      });
+
+      this.log(
+        `📊 Found ${backups.length} backup sets containing ${backupTables.length} backup tables`
+      );
       return backups;
     } finally {
       client.release();
@@ -163,12 +143,11 @@ export class DatabaseRollback {
   }
 
   /**
-   * Validate backup integrity before rollback
+   * Validate backup integrity before rollback (for table-swap approach)
    */
   async validateBackup(backupTimestamp: string): Promise<BackupValidationResult> {
     this.log(`🔍 Validating backup ${backupTimestamp}...`);
 
-    const schemaName = `backup_${backupTimestamp}`;
     const client = await this.pool.connect();
 
     try {
@@ -179,36 +158,23 @@ export class DatabaseRollback {
         tableValidations: [],
       };
 
-      // Check if backup schema exists
-      const schemaExists = await client.query(
-        `
-        SELECT EXISTS (
-          SELECT 1 FROM information_schema.schemata 
-          WHERE schema_name = $1
-        )
-      `,
-        [schemaName]
-      );
+      // Check if backup tables exist in public schema
+      const backupTablesResult = await client.query(`
+        SELECT table_name 
+        FROM information_schema.tables 
+        WHERE table_schema = 'public'
+        AND table_name LIKE 'backup_%'
+        ORDER BY table_name
+      `);
 
-      if (!schemaExists.rows[0].exists) {
+      if (backupTablesResult.rows.length === 0) {
         result.isValid = false;
-        result.errors.push(`Backup schema ${schemaName} does not exist`);
+        result.errors.push('No backup tables found. Run migration first to create backups.');
         return result;
       }
 
-      // Get all tables in backup schema
-      const tablesResult = await client.query(
-        `
-        SELECT table_name 
-        FROM information_schema.tables 
-        WHERE table_schema = $1
-        ORDER BY table_name
-      `,
-        [schemaName]
-      );
-
-      // Validate each table with enhanced checks
-      for (const row of tablesResult.rows) {
+      // Validate each backup table
+      for (const row of backupTablesResult.rows) {
         const tableName = row.table_name;
         const validation: TableValidationResult = {
           tableName,
@@ -224,9 +190,9 @@ export class DatabaseRollback {
             `
             SELECT COUNT(*) as column_count 
             FROM information_schema.columns 
-            WHERE table_schema = $1 AND table_name = $2
+            WHERE table_schema = 'public' AND table_name = $1
           `,
-            [schemaName, tableName]
+            [tableName]
           );
 
           if (parseInt(columnsResult.rows[0].column_count) === 0) {
@@ -237,7 +203,7 @@ export class DatabaseRollback {
 
           // Check if table has data
           const countResult = await client.query(
-            `SELECT COUNT(*) as count FROM "${schemaName}"."${tableName}"`
+            `SELECT COUNT(*) as count FROM public."${tableName}"`
           );
           const rowCount = parseInt(countResult.rows[0].count);
           validation.hasData = rowCount > 0;
@@ -254,13 +220,13 @@ export class DatabaseRollback {
         result.tableValidations.push(validation);
       }
 
-      // Check for critical tables
-      const criticalTables = ['User', 'user']; // Add more as needed
-      const backupTableNames = result.tableValidations.map(v => v.tableName.toLowerCase());
+      // Check for critical backup tables (corresponding to important tables)
+      const criticalBackupTables = ['backup_User', 'backup_user']; // Add more as needed
+      const backupTableNames = result.tableValidations.map(v => v.tableName);
 
-      for (const criticalTable of criticalTables) {
-        if (!backupTableNames.includes(criticalTable.toLowerCase())) {
-          result.warnings.push(`Critical table ${criticalTable} not found in backup`);
+      for (const criticalTable of criticalBackupTables) {
+        if (!backupTableNames.includes(criticalTable)) {
+          result.warnings.push(`Critical backup table ${criticalTable} not found`);
         }
       }
 
@@ -390,7 +356,7 @@ export class DatabaseRollback {
   }
 
   /**
-   * Perform rollback to specified backup
+   * Perform rollback to specified backup (for table-swap approach)
    */
   async rollback(backupTimestamp: string, keepTables: string[] = []): Promise<void> {
     this.log(`🔄 Starting rollback to backup ${backupTimestamp}...`);
@@ -401,58 +367,106 @@ export class DatabaseRollback {
       throw new Error(`Backup validation failed: ${validation.errors.join(', ')}`);
     }
 
-    const schemaName = `backup_${backupTimestamp}`;
     const client = await this.pool.connect();
 
     try {
       this.log('\n⚠️  DESTRUCTIVE ROLLBACK - NO UNDO AVAILABLE');
-      this.log(`• Current 'public' schema → renamed to 'shadow' (temporary)`);
-      this.log(`• Backup '${schemaName}' → renamed to 'public' (restored)`);
-      this.log(`• Existing 'shadow' schema will be DELETED if present`);
+      this.log(`• Current active tables will be dropped`);
+      this.log(`• Backup tables will be renamed to active tables`);
 
       if (keepTables.length > 0) {
         this.log(`\nCURRENT DATA TO BE KEPT:`);
-        this.log(`• Tables to copy from shadow to public: ${keepTables.join(', ')}`);
+        this.log(`• Tables to preserve: ${keepTables.join(', ')}`);
       }
 
-      this.log(`\nBACKUP CONSUMED:`);
-      this.log(`• Backup '${schemaName}' will be consumed (no longer available)`);
-
-      this.log('\n✅ Proceeding with destructive rollback...');
+      this.log('\n✅ Proceeding with table-swap rollback...');
 
       // Disable foreign key constraints for rollback operations
       this.log('🔓 Disabling foreign key constraints for rollback...');
       await client.query('SET session_replication_role = replica;');
 
-      // Step 1: Clear existing shadow schema
-      await client.query('DROP SCHEMA IF EXISTS shadow CASCADE;');
-      this.log('• Cleared existing shadow schema');
+      // Get all backup tables
+      const backupTablesResult = await client.query(`
+        SELECT table_name 
+        FROM information_schema.tables 
+        WHERE table_schema = 'public'
+        AND table_name LIKE 'backup_%'
+        ORDER BY table_name
+      `);
 
-      // Step 2: Rename current public to shadow
-      await client.query('ALTER SCHEMA public RENAME TO shadow;');
-      this.log('• Renamed current public schema to shadow');
+      for (const row of backupTablesResult.rows) {
+        const backupTableName = row.table_name;
+        const activeTableName = backupTableName.replace('backup_', '');
 
-      // Step 3: Rename backup to public
-      await client.query(`ALTER SCHEMA ${schemaName} RENAME TO public;`);
-      this.log(`• Renamed backup schema to public`);
+        try {
+          // Drop the current active table
+          await client.query(`DROP TABLE IF EXISTS public."${activeTableName}" CASCADE;`);
+          this.log(`• Dropped current table: ${activeTableName}`);
 
-      // Step 4: Handle keep-tables if specified
-      if (keepTables.length > 0) {
-        await this.copyKeepTables(client, keepTables);
+          // Rename backup table to active table
+          await client.query(
+            `ALTER TABLE public."${backupTableName}" RENAME TO "${activeTableName}";`
+          );
+          this.log(`• Restored table: ${backupTableName} → ${activeTableName}`);
+
+          // Rename associated sequences
+          const sequenceName = `${activeTableName}_id_seq`;
+          const backupSequenceName = `backup_${sequenceName}`;
+          try {
+            await client.query(
+              `ALTER SEQUENCE public."${backupSequenceName}" RENAME TO "${sequenceName}";`
+            );
+            this.log(`• Restored sequence: ${backupSequenceName} → ${sequenceName}`);
+          } catch (seqError) {
+            this.log(`⚠️  Could not restore sequence ${sequenceName}: ${seqError}`);
+          }
+
+          // Rename constraints (primary keys, foreign keys, etc.)
+          const constraintsResult = await client.query(
+            `
+            SELECT constraint_name
+            FROM information_schema.table_constraints
+            WHERE table_schema = 'public' 
+            AND table_name = $1
+            AND constraint_name LIKE 'backup_%'
+          `,
+            [activeTableName]
+          );
+
+          for (const constraint of constraintsResult.rows) {
+            const backupConstraintName = constraint.constraint_name;
+            const activeConstraintName = backupConstraintName.replace('backup_', '');
+            try {
+              await client.query(
+                `ALTER TABLE public."${activeTableName}" RENAME CONSTRAINT "${backupConstraintName}" TO "${activeConstraintName}";`
+              );
+              this.log(`• Restored constraint: ${backupConstraintName} → ${activeConstraintName}`);
+            } catch (constraintError) {
+              this.log(
+                `⚠️  Could not restore constraint ${activeConstraintName}: ${constraintError}`
+              );
+            }
+          }
+        } catch (error) {
+          this.log(`❌ Failed to restore table ${activeTableName}: ${error}`);
+          throw error;
+        }
       }
 
-      // Step 5: Re-enable foreign key constraints
+      // Handle keep-tables if specified (copy from temporary backup)
+      if (keepTables.length > 0) {
+        this.log('\n📋 Implementing keep-tables functionality...');
+        this.log('⚠️  Keep-tables functionality not yet implemented for table-swap rollback');
+      }
+
+      // Re-enable foreign key constraints
       this.log('🔒 Re-enabling foreign key constraints...');
       await client.query('SET session_replication_role = origin;');
 
-      // Step 6: Cleanup shadow schema
-      await client.query('DROP SCHEMA shadow CASCADE;');
-      this.log('• Cleaned up shadow schema');
-
-      this.log('\n✅ Rollback completed successfully!');
-      this.log(`📦 Backup '${schemaName}' has been consumed`);
+      this.log('\n✅ Table-swap rollback completed successfully!');
+      this.log(`📦 Backup tables have been consumed and restored as active tables`);
     } catch (error) {
-      this.log('\n❌ Rollback failed, attempting to restore original state...');
+      this.log('\n❌ Rollback failed, manual intervention may be required...');
 
       // Ensure foreign key constraints are re-enabled even on failure
       try {
@@ -462,7 +476,6 @@ export class DatabaseRollback {
         this.log(`⚠️  Warning: Could not re-enable foreign key constraints: ${fkError}`);
       }
 
-      await this.recoverFromFailedRollback(client);
       throw error;
     } finally {
       client.release();

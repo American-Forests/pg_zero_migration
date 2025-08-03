@@ -641,47 +641,49 @@ describe('Database Migration Integration Tests', () => {
 
     async function validateSchemaCompatibility(
       loader: DbTestLoader,
-      backupSchema: string
+      _backupSchema: string
     ): Promise<void> {
-      // Compare table counts between schemas
+      // For table-swap approach: compare backup tables vs active tables
       const backupTableCount = await loader.executeQuery(
-        `SELECT COUNT(*) as count FROM information_schema.tables WHERE table_schema = $1`,
-        [backupSchema]
+        `SELECT COUNT(*) as count FROM information_schema.tables 
+         WHERE table_schema = 'public' AND table_name LIKE 'backup_%'`
       );
-      const publicTableCount = await loader.executeQuery(
-        `SELECT COUNT(*) as count FROM information_schema.tables WHERE table_schema = 'public'`
+
+      // Get active table count (excluding backup tables, shadow tables, and system tables)
+      const activeTableCount = await loader.executeQuery(
+        `SELECT COUNT(*) as count FROM information_schema.tables 
+         WHERE table_schema = 'public' 
+         AND table_name NOT LIKE 'backup_%'
+         AND table_name NOT LIKE 'shadow_%'
+         AND table_name NOT IN ('geography_columns', 'geometry_columns', 'spatial_ref_sys')`
       );
 
       const backupCount = parseInt(backupTableCount[0].count);
-      const publicCount = parseInt(publicTableCount[0].count);
+      const activeCount = parseInt(activeTableCount[0].count);
 
-      // Allow reasonable difference in table counts
-      expect(Math.abs(backupCount - publicCount)).toBeLessThanOrEqual(5);
+      // For table-swap, backup count should equal active count (1:1 mapping)
+      expect(backupCount).toBe(activeCount);
 
-      // Verify critical tables exist in both schemas
-      const criticalTables = await loader.executeQuery(`
-        SELECT table_name 
-        FROM information_schema.tables 
-        WHERE table_schema = 'public' 
-        ORDER BY table_name 
-        LIMIT 10
-      `);
+      // Verify each backup table has a corresponding active table
+      const backupTables = await loader.executeQuery(
+        `SELECT REPLACE(table_name, 'backup_', '') as original_name 
+         FROM information_schema.tables 
+         WHERE table_schema = 'public' AND table_name LIKE 'backup_%'`
+      );
 
-      for (const table of criticalTables) {
-        const tableName = table.table_name;
-        const backupHasTable = await loader.executeQuery(
+      for (const backup of backupTables) {
+        const activeExists = await loader.executeQuery(
           `SELECT EXISTS (
             SELECT 1 FROM information_schema.tables 
-            WHERE table_schema = $1 AND table_name = $2
+            WHERE table_schema = 'public' AND table_name = $1
           )`,
-          [backupSchema, tableName]
+          [backup.original_name]
         );
-
-        expect(backupHasTable[0].exists).toBe(true);
+        expect(activeExists[0].exists).toBe(true);
       }
 
       console.log(
-        `✅ Schema compatibility validated: backup(${backupCount}) vs public(${publicCount}) tables`
+        `✅ Schema compatibility validated: backup(${backupCount}) vs active(${activeCount}) tables`
       );
     }
 
@@ -691,14 +693,17 @@ describe('Database Migration Integration Tests', () => {
 
     async function validateTableDataIntegrity(
       loader: DbTestLoader,
-      schemaName: string,
+      _schemaName: string,
       tableName: string
     ): Promise<void> {
+      // For table-swap: backup tables are in public schema with backup_ prefix
+      const backupTableName = `backup_${tableName}`;
+
       // Performance-optimized: Only sample first 100 rows
       const sampleCheck = await loader.executeQuery(`
         SELECT COUNT(*) as valid_count
         FROM (
-          SELECT * FROM "${schemaName}"."${tableName}" 
+          SELECT * FROM public."${backupTableName}" 
           WHERE ctid IS NOT NULL  -- Basic validity check
           LIMIT 100
         ) sample
@@ -708,7 +713,7 @@ describe('Database Migration Integration Tests', () => {
 
       // Check if table has data
       const totalCount = await loader.executeQuery(
-        `SELECT COUNT(*) as count FROM "${schemaName}"."${tableName}"`
+        `SELECT COUNT(*) as count FROM public."${backupTableName}"`
       );
       const hasData = parseInt(totalCount[0].count) > 0;
 
@@ -722,7 +727,7 @@ describe('Database Migration Integration Tests', () => {
         const pkCheck = await loader.executeQuery(`
           SELECT COUNT(*) as pk_violations
           FROM (
-            SELECT * FROM "${schemaName}"."${tableName}" 
+            SELECT * FROM public."${backupTableName}" 
             WHERE id IS NULL  -- Assuming 'id' is common primary key
             LIMIT 10
           ) pk_sample

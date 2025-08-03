@@ -332,7 +332,7 @@ export class DatabaseMigrator {
 
       const shadowTableCount = parseInt(shadowTables.rows[0].count);
       if (shadowTableCount === 0) {
-        issues.push('❌ No shadow tables found. Run prepare command first.');
+        issues.push('❌ Shadow schema does not exist');
       } else {
         this.log(`✅ Found ${shadowTableCount} shadow tables`);
       }
@@ -1594,13 +1594,10 @@ export class DatabaseMigrator {
 
         for (const idxRow of indexes.rows) {
           const oldIdxName = idxRow.indexname;
-          if (oldIdxName.startsWith(originalName)) {
-            const newIdxName = oldIdxName.replace(originalName, shadowName);
-            await sourceClient.query(
-              `ALTER INDEX public."${oldIdxName}" RENAME TO "${newIdxName}"`
-            );
-            this.log(`📝 Renamed source index: ${oldIdxName} → ${newIdxName}`);
-          }
+          // Always rename all indexes for the table to avoid naming conflicts during restore
+          const newIdxName = `shadow_${oldIdxName}`;
+          await sourceClient.query(`ALTER INDEX public."${oldIdxName}" RENAME TO "${newIdxName}"`);
+          this.log(`📝 Renamed source index: ${oldIdxName} → ${newIdxName}`);
         }
       }
 
@@ -1627,8 +1624,9 @@ export class DatabaseMigrator {
 
         for (const idxRow of indexes.rows) {
           const shadowIdxName = idxRow.indexname;
-          if (shadowIdxName.startsWith(shadowName)) {
-            const originalIdxName = shadowIdxName.replace(shadowName, originalName);
+          // All indexes now have shadow_ prefix, remove it to restore original name
+          if (shadowIdxName.startsWith('shadow_')) {
+            const originalIdxName = shadowIdxName.substring(7); // Remove 'shadow_' prefix
             await sourceClient.query(
               `ALTER INDEX public."${shadowIdxName}" RENAME TO "${originalIdxName}"`
             );
