@@ -463,20 +463,32 @@ export class DatabaseMigrator {
     timestamp: number,
     _migrationId: string
   ): Promise<void> {
+    const preparationStartTime = Date.now();
     this.log('🔄 Starting migration preparation phases...');
 
     try {
       // Phase 1: Create source dump
+      const phase1StartTime = Date.now();
       const dumpPath = await this.createSourceDump(sourceTables, timestamp);
+      const phase1Duration = Date.now() - phase1StartTime;
+      this.log(`✅ Phase 1 completed (${this.formatDuration(phase1Duration)})`);
 
       // Phase 2: Restore source dump to destination shadow schema
+      const phase2StartTime = Date.now();
       await this.restoreToDestinationShadow(sourceTables, dumpPath);
+      const phase2Duration = Date.now() - phase2StartTime;
+      this.log(`✅ Phase 2 completed (${this.formatDuration(phase2Duration)})`);
 
       // Phase 3: Setup preserved table synchronization
+      const phase3StartTime = Date.now();
       await this.setupPreservedTableSync(destTables, timestamp);
+      const phase3Duration = Date.now() - phase3StartTime;
+      this.log(`✅ Phase 3 completed (${this.formatDuration(phase3Duration)})`);
 
+      const totalPreparationDuration = Date.now() - preparationStartTime;
       this.log('✅ Preparation phases completed successfully');
       this.log(`📦 Shadow schema ready for swap`);
+      this.log(`⏱️ Total preparation time: ${this.formatDuration(totalPreparationDuration)}`);
       this.log('💡 Run the swap command when ready to complete migration');
     } catch (error) {
       // Cleanup any partial preparation state
@@ -497,26 +509,41 @@ export class DatabaseMigrator {
    * Perform completion phases (4-7)
    */
   private async doCompletion(sourceTables: TableInfo[], timestamp: number): Promise<void> {
+    const completionStartTime = Date.now();
     this.log('🔄 Starting migration completion phases...');
 
     try {
       // Phase 4: Perform atomic schema swap (zero downtime!)
+      const phase4StartTime = Date.now();
       await this.performAtomicSchemaSwap(timestamp);
+      const phase4Duration = Date.now() - phase4StartTime;
+      this.log(`✅ Phase 4 completed (${this.formatDuration(phase4Duration)})`);
 
       // Phase 5: Cleanup sync triggers and validate consistency
+      const phase5StartTime = Date.now();
       await this.cleanupSyncTriggersAndValidate(timestamp);
+      const phase5Duration = Date.now() - phase5StartTime;
+      this.log(`✅ Phase 5 completed (${this.formatDuration(phase5Duration)})`);
 
       // Phase 6: Reset sequences and recreate indexes
+      const phase6StartTime = Date.now();
       this.log('🔢 Phase 6: Resetting sequences...');
       await this.resetSequences(sourceTables);
+      const phase6Duration = Date.now() - phase6StartTime;
+      this.log(`✅ Phase 6 completed (${this.formatDuration(phase6Duration)})`);
 
+      const phase7StartTime = Date.now();
       this.log('🗂️  Phase 7: Recreating indexes...');
       await this.recreateIndexes(sourceTables);
+      const phase7Duration = Date.now() - phase7StartTime;
+      this.log(`✅ Phase 7 completed (${this.formatDuration(phase7Duration)})`);
 
       // Write protection was already disabled after schema swap in Phase 4
 
+      const totalCompletionDuration = Date.now() - completionStartTime;
       this.log('✅ Zero-downtime migration finished successfully');
       this.log(`📦 Original schema preserved in backup_${timestamp} schema`);
+      this.log(`⏱️ Total completion time: ${this.formatDuration(totalCompletionDuration)}`);
       this.log('💡 Call cleanupBackupSchema(timestamp) to remove backup after verification');
     } catch (error) {
       this.logError('Migration completion failed', error);
@@ -1432,6 +1459,7 @@ export class DatabaseMigrator {
 
       // Restore shadow schema data with full parallelization
       const jobCount = Math.min(8, cpus().length);
+      const restoreStartTime = Date.now();
       this.log(`🚀 Restoring with ${jobCount} parallel jobs...`);
 
       const restoreArgs = [
@@ -1458,8 +1486,20 @@ export class DatabaseMigrator {
         PGPASSWORD: this.destConfig.password,
       };
 
-      await execa('pg_restore', restoreArgs, { env: restoreEnv });
-      this.log('✅ Source data restored to shadow schema with parallelization');
+      try {
+        await execa('pg_restore', restoreArgs, { env: restoreEnv });
+        const restoreDuration = Date.now() - restoreStartTime;
+        this.log(
+          `✅ Source data restored to shadow schema with parallelization (${this.formatDuration(restoreDuration)})`
+        );
+      } catch (error) {
+        const restoreDuration = Date.now() - restoreStartTime;
+        this.logError(
+          `Restore failed after ${this.formatDuration(restoreDuration)}`,
+          error as Error
+        );
+        throw error;
+      }
 
       // Clean up dump file
       if (existsSync(dumpPath)) {
@@ -1480,6 +1520,7 @@ export class DatabaseMigrator {
    * Create binary dump of source database
    */
   private async createBinaryDump(dumpPath: string): Promise<void> {
+    const startTime = Date.now();
     this.log('📦 Creating binary dump of source database...');
 
     const dumpArgs = [
@@ -1505,8 +1546,17 @@ export class DatabaseMigrator {
 
     const dumpEnv = { ...process.env, PGPASSWORD: this.sourceConfig.password };
 
-    await execa('pg_dump', dumpArgs, { env: dumpEnv });
-    this.log(`✅ Binary dump created: ${dumpPath}`);
+    try {
+      await execa('pg_dump', dumpArgs, { env: dumpEnv });
+      const duration = Date.now() - startTime;
+      this.log(
+        `✅ Binary dump created successfully (${this.formatDuration(duration)}): ${dumpPath}`
+      );
+    } catch (error) {
+      const duration = Date.now() - startTime;
+      this.logError(`Dump failed after ${this.formatDuration(duration)}`, error as Error);
+      throw error;
+    }
   }
 
   /**
@@ -1608,6 +1658,7 @@ export class DatabaseMigrator {
    * Phase 4: Perform atomic schema swap
    */
   private async performAtomicSchemaSwap(timestamp: number): Promise<void> {
+    const swapStartTime = Date.now();
     this.log('🔄 Phase 4: Performing atomic schema swap...');
 
     const client = await this.destPool.connect();
@@ -1638,7 +1689,10 @@ export class DatabaseMigrator {
       this.log('🔓 Removing write protection after atomic swap completion...');
       await this.disableDestinationWriteProtection();
 
-      this.log('✅ Atomic schema swap completed - migration is now live!');
+      const swapDuration = Date.now() - swapStartTime;
+      this.log(
+        `✅ Atomic schema swap completed - migration is now live! (${this.formatDuration(swapDuration)})`
+      );
 
       // Validate the atomic schema swap completed successfully
       await this.validateAtomicSchemaSwap(timestamp);
@@ -1654,6 +1708,8 @@ export class DatabaseMigrator {
    * Phase 3: Setup preserved table synchronization
    */
   private async setupPreservedTableSync(destTables: TableInfo[], timestamp: number): Promise<void> {
+    const syncStartTime = Date.now();
+
     if (this.preservedTables.size === 0) {
       this.log('✅ No preserved tables to sync');
       return;
@@ -1753,8 +1809,9 @@ export class DatabaseMigrator {
         }
       }
 
+      const syncDuration = Date.now() - syncStartTime;
       this.log(
-        `✅ Real-time sync setup complete for ${this.activeSyncTriggers.length} preserved tables (backup_${timestamp})`
+        `✅ Real-time sync setup complete for ${this.activeSyncTriggers.length} preserved tables (${this.formatDuration(syncDuration)}) (backup_${timestamp})`
       );
     } catch (error) {
       // Cleanup any triggers created so far
@@ -2286,6 +2343,16 @@ export class DatabaseMigrator {
   }
 
   /**
+   * Format duration in milliseconds to human readable format
+   */
+  private formatDuration(ms: number): string {
+    if (ms < 1000) return `${ms}ms`;
+    if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
+    if (ms < 3600000) return `${(ms / 60000).toFixed(1)}m`;
+    return `${(ms / 3600000).toFixed(1)}h`;
+  }
+
+  /**
    * Log migration summary
    */
   private logSummary(): void {
@@ -2294,7 +2361,7 @@ export class DatabaseMigrator {
       : 0;
 
     this.log('📊 Migration Summary:');
-    this.log(`   ⏱️  Duration: ${duration}s`);
+    this.log(`   ⏱️  Total Duration: ${this.formatDuration(duration * 1000)}`);
     this.log(`   📦 Tables processed: ${this.stats.tablesProcessed}`);
     this.log(`   📊 Records migrated: ${this.stats.recordsMigrated}`);
     this.log(`   ⚠️  Warnings: ${this.stats.warnings.length}`);

@@ -45,8 +45,20 @@ class MigrationManager {
     this.rollbackManager = new DatabaseRollback(config);
   }
 
+  /**
+   * Log a message with timestamp
+   */
   private log(message: string): void {
-    console.log(message);
+    const timestamp = new Date().toISOString();
+    console.log(`[${timestamp}] INFO: ${message}`);
+  }
+
+  /**
+   * Log an error with timestamp
+   */
+  private logError(message: string, error?: Error): void {
+    const timestamp = new Date().toISOString();
+    console.error(`[${timestamp}] ERROR: ${message}`, error || '');
   }
 
   private async connect(): Promise<void> {
@@ -98,10 +110,11 @@ class MigrationManager {
 
   private printBackupsTable(backups: BackupInfo[]): void {
     if (backups.length === 0) {
-      console.log('No backup schemas found.');
+      this.log('No backup schemas found.');
       return;
     }
 
+    // Table headers don't need timestamps as they're formatting
     console.log('┌─────────────────┬─────────────────────┬────────┬──────────┐');
     console.log('│ Timestamp       │ Created             │ Tables │ Size     │');
     console.log('├─────────────────┼─────────────────────┼────────┼──────────┤');
@@ -332,9 +345,17 @@ Two-Phase Migration Workflow:
 }
 
 /**
+ * Log a message with timestamp for main function operations
+ */
+function logWithTimestamp(message: string): void {
+  const timestamp = new Date().toISOString();
+  console.log(`[${timestamp}] INFO: ${message}`);
+}
+
+/**
  * Write migration log to disk file
  */
-function writeLogFile(
+export function writeLogFile(
   result: MigrationResult,
   sourceConfig: DatabaseConfig,
   destConfig: DatabaseConfig
@@ -482,10 +503,10 @@ async function handlePrepareCommand(values: ParsedArgs, dryRun: boolean): Promis
   const sourceConfig = parseDatabaseUrl(sourceUrl);
   const destConfig = parseDatabaseUrl(destUrl);
 
-  console.log('🚀 Database Migration Tool - Preparation Phase');
-  console.log(`📍 Source: ${sourceConfig.host}:${sourceConfig.port}/${sourceConfig.database}`);
-  console.log(`📍 Destination: ${destConfig.host}:${destConfig.port}/${destConfig.database}`);
-  console.log(`🔒 Preserved tables: ${preservedTables.join(', ') || 'none'}`);
+  logWithTimestamp('🚀 Database Migration Tool - Preparation Phase');
+  logWithTimestamp(`📍 Source: ${sourceConfig.host}:${sourceConfig.port}/${sourceConfig.database}`);
+  logWithTimestamp(`📍 Destination: ${destConfig.host}:${destConfig.port}/${destConfig.database}`);
+  logWithTimestamp(`🔒 Preserved tables: ${preservedTables.join(', ') || 'none'}`);
   console.log('');
 
   const migrator = new DatabaseMigrator(sourceConfig, destConfig, preservedTables, dryRun);
@@ -495,14 +516,14 @@ async function handlePrepareCommand(values: ParsedArgs, dryRun: boolean): Promis
 
     if (result.success) {
       if (dryRun) {
-        console.log('\n✅ Dry run preparation completed successfully!');
-        console.log('💡 Review the analysis above and run without --dry-run when ready');
+        logWithTimestamp('✅ Dry run preparation completed successfully!');
+        logWithTimestamp('💡 Review the analysis above and run without --dry-run when ready');
       } else {
-        console.log('\n✅ Migration preparation completed successfully!');
-        console.log(`📄 Migration ID: ${result.migrationId}`);
-        console.log(`🔢 Timestamp: ${result.timestamp}`);
-        console.log(`🔄 Active sync triggers: ${result.activeTriggers.length}`);
-        console.log('📦 Shadow schema ready for swap');
+        logWithTimestamp('✅ Migration preparation completed successfully!');
+        logWithTimestamp(`📄 Migration ID: ${result.migrationId}`);
+        logWithTimestamp(`🔢 Timestamp: ${result.timestamp}`);
+        logWithTimestamp(`🔄 Active sync triggers: ${result.activeTriggers.length}`);
+        logWithTimestamp('📦 Shadow schema ready for swap');
 
         // Generate the exact swap command to run next
         let swapCommand = `npm run migration -- swap --dest "${destUrl}"`;
@@ -546,9 +567,9 @@ async function handleSwapCommand(values: ParsedArgs, dryRun: boolean): Promise<v
     .map((table: string) => table.trim())
     .filter((table: string) => table.length > 0);
 
-  console.log('🔄 Database Migration Tool - Swap Phase');
-  console.log(`📍 Destination: ${destConfig.host}:${destConfig.port}/${destConfig.database}`);
-  console.log(`� Expected preserved tables: ${preservedTables.join(', ') || 'none'}`);
+  logWithTimestamp('🔄 Database Migration Tool - Swap Phase');
+  logWithTimestamp(`📍 Destination: ${destConfig.host}:${destConfig.port}/${destConfig.database}`);
+  logWithTimestamp(`🔒 Expected preserved tables: ${preservedTables.join(', ') || 'none'}`);
   console.log('');
 
   const migrator = new DatabaseMigrator({} as DatabaseConfig, destConfig, preservedTables, dryRun);
@@ -557,8 +578,8 @@ async function handleSwapCommand(values: ParsedArgs, dryRun: boolean): Promise<v
     const result: MigrationResult = await migrator.completeMigration(preservedTables);
 
     if (result.success) {
-      console.log('\n✅ Migration swap completed successfully!');
-      console.log('📦 Schema backup retained for rollback purposes');
+      logWithTimestamp('✅ Migration swap completed successfully!');
+      logWithTimestamp('📦 Schema backup retained for rollback purposes');
       process.exit(0);
     } else {
       console.error('\n❌ Migration swap failed:', result.error);
