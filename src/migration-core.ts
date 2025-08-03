@@ -332,7 +332,7 @@ export class DatabaseMigrator {
 
       const shadowTableCount = parseInt(shadowTables.rows[0].count);
       if (shadowTableCount === 0) {
-        issues.push('❌ Shadow schema does not exist');
+        issues.push('❌ No shadow tables found');
       } else {
         this.log(`✅ Found ${shadowTableCount} shadow tables`);
       }
