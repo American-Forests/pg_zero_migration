@@ -2205,6 +2205,17 @@ export class DatabaseMigrator {
             // Step 2.1: Validate trigger was created successfully
             await this.validateTriggerExists(triggerInfo);
 
+            // Step 2.2: Validate sync consistency between preserved table and shadow table
+            const syncValidation = await this.validateSyncConsistency(actualTableName);
+            if (!syncValidation.isValid) {
+              throw new Error(
+                `Sync consistency validation failed for ${actualTableName}: ${syncValidation.errors.join(', ')}`
+              );
+            }
+            this.log(
+              `✅ Sync consistency validated for ${actualTableName}: ${syncValidation.sourceRowCount} rows match`
+            );
+
             // Step 3: Basic sync setup validation
             const rowCountResult = await client.query(
               `SELECT COUNT(*) FROM public."${actualTableName}"`
@@ -2430,15 +2441,40 @@ export class DatabaseMigrator {
   }
 
   /**
-   * Validate sync consistency between public and shadow schemas
+   * Validate sync consistency between preserved tables and shadow tables (table-swap approach)
    */
   private async validateSyncConsistency(tableName: string): Promise<SyncValidationResult> {
     const client = await this.destPool.connect();
 
     try {
+      const shadowTableName = `shadow_${tableName}`;
+
+      // Check if shadow table exists
+      const shadowExistsResult = await client.query(
+        `SELECT EXISTS (
+          SELECT 1 FROM information_schema.tables 
+          WHERE table_schema = 'public' AND table_name = $1
+        )`,
+        [shadowTableName]
+      );
+
+      if (!shadowExistsResult.rows[0].exists) {
+        return {
+          tableName,
+          isValid: false,
+          sourceRowCount: 0,
+          targetRowCount: 0,
+          sourceChecksum: '',
+          targetChecksum: '',
+          errors: [`Shadow table ${shadowTableName} does not exist`],
+        };
+      }
+
       // Get row counts
       const sourceCountResult = await client.query(`SELECT COUNT(*) FROM public."${tableName}"`);
-      const targetCountResult = await client.query(`SELECT COUNT(*) FROM shadow."${tableName}"`);
+      const targetCountResult = await client.query(
+        `SELECT COUNT(*) FROM public."${shadowTableName}"`
+      );
 
       const sourceRowCount = parseInt(sourceCountResult.rows[0].count);
       const targetRowCount = parseInt(targetCountResult.rows[0].count);
@@ -2463,18 +2499,18 @@ export class DatabaseMigrator {
         const pkColumnsStr = pkColumns.map(col => `"${col}"::text`).join(` || ',' || `);
         checksumQuery = `
           SELECT md5(string_agg(${pkColumnsStr}, ',' ORDER BY ${pkColumns.map(col => `"${col}"`).join(', ')})) as checksum 
-          FROM TABLE_PLACEHOLDER."${tableName}"
+          FROM public."TABLE_PLACEHOLDER"
         `;
       } else {
         // Fallback to row count only if no primary key found
-        checksumQuery = `SELECT md5(COUNT(*)::text) as checksum FROM TABLE_PLACEHOLDER."${tableName}"`;
+        checksumQuery = `SELECT md5(COUNT(*)::text) as checksum FROM public."TABLE_PLACEHOLDER"`;
       }
 
       const sourceChecksumResult = await client.query(
-        checksumQuery.replace('TABLE_PLACEHOLDER', 'public')
+        checksumQuery.replace('TABLE_PLACEHOLDER', tableName)
       );
       const targetChecksumResult = await client.query(
-        checksumQuery.replace('TABLE_PLACEHOLDER', 'shadow')
+        checksumQuery.replace('TABLE_PLACEHOLDER', shadowTableName)
       );
 
       const sourceChecksum = sourceChecksumResult.rows[0]?.checksum || '';
