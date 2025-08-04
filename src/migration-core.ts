@@ -1594,10 +1594,16 @@ export class DatabaseMigrator {
 
         for (const idxRow of indexes.rows) {
           const oldIdxName = idxRow.indexname;
-          // Always rename all indexes for the table to avoid naming conflicts during restore
-          const newIdxName = `shadow_${oldIdxName}`;
-          await sourceClient.query(`ALTER INDEX public."${oldIdxName}" RENAME TO "${newIdxName}"`);
-          this.log(`📝 Renamed source index: ${oldIdxName} → ${newIdxName}`);
+          // Only add shadow_ prefix if the index doesn't already have it
+          // This prevents double shadow prefixes when indexes are named after constraints
+          const newIdxName = oldIdxName.startsWith('shadow_') ? oldIdxName : `shadow_${oldIdxName}`;
+
+          if (newIdxName !== oldIdxName) {
+            await sourceClient.query(
+              `ALTER INDEX public."${oldIdxName}" RENAME TO "${newIdxName}"`
+            );
+            this.log(`📝 Renamed source index: ${oldIdxName} → ${newIdxName}`);
+          }
         }
       }
 
