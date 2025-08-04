@@ -109,6 +109,8 @@ describe('Migration CLI Integration Tests', () => {
       actualSourceUrl,
       '--dest',
       actualDestUrl,
+      '--preserved-tables',
+      'BlockgroupOnScenario,AreaOnScenario,Scenario,User',
     ];
 
     console.log('🔄 Running CLI migration command...');
