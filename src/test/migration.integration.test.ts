@@ -2353,6 +2353,243 @@ describe('TES Schema Migration Integration Tests', () => {
       throw new Error('Test loaders not initialized');
     }
 
+    // ===== DATABASE STATE CAPTURE HELPER FUNCTIONS =====
+
+    interface DatabaseState {
+      tables: Array<{ table_name: string }>;
+      constraints: Array<{ constraint_name: string; table_name: string; constraint_type: string }>;
+      indexes: Array<{ indexname: string; tablename: string }>;
+      sequences: Array<{ sequence_name: string }>;
+      triggers: Array<{ trigger_name: string; event_object_table: string }>;
+      functions: Array<{ proname: string }>;
+    }
+
+    /**
+     * Captures complete state of source database for comparison
+     */
+    async function captureSourceDatabaseState(label: string): Promise<DatabaseState> {
+      console.log(`📊 Capturing source database state: ${label}`);
+
+      // Get all tables in public schema (excluding system tables)
+      const tables = await sourceLoader.executeQuery(`
+        SELECT table_name 
+        FROM information_schema.tables 
+        WHERE table_schema = 'public' 
+        AND table_type = 'BASE TABLE'
+        AND table_name NOT IN ('spatial_ref_sys', 'geography_columns', 'geometry_columns')
+        ORDER BY table_name
+      `);
+
+      // Get all constraints
+      const constraints = await sourceLoader.executeQuery(`
+        SELECT constraint_name, table_name, constraint_type
+        FROM information_schema.table_constraints 
+        WHERE table_schema = 'public' 
+        AND table_name NOT IN ('spatial_ref_sys', 'geography_columns', 'geometry_columns')
+        ORDER BY constraint_name
+      `);
+
+      // Get all indexes
+      const indexes = await sourceLoader.executeQuery(`
+        SELECT indexname, tablename
+        FROM pg_indexes 
+        WHERE schemaname = 'public' 
+        AND tablename NOT IN ('spatial_ref_sys', 'geography_columns', 'geometry_columns')
+        ORDER BY indexname
+      `);
+
+      // Get all sequences
+      const sequences = await sourceLoader.executeQuery(`
+        SELECT sequence_name
+        FROM information_schema.sequences 
+        WHERE sequence_schema = 'public' 
+        ORDER BY sequence_name
+      `);
+
+      // Get all triggers (excluding system triggers)
+      const triggers = await sourceLoader.executeQuery(`
+        SELECT trigger_name, event_object_table
+        FROM information_schema.triggers 
+        WHERE trigger_schema = 'public'
+        AND event_object_table NOT IN ('spatial_ref_sys', 'geography_columns', 'geometry_columns')
+        ORDER BY trigger_name
+      `);
+
+      // Get all functions (excluding system functions)
+      const functions = await sourceLoader.executeQuery(`
+        SELECT proname
+        FROM pg_proc p
+        JOIN pg_namespace n ON p.pronamespace = n.oid
+        WHERE n.nspname = 'public'
+        AND proname NOT LIKE 'st_%'  -- Exclude PostGIS functions
+        ORDER BY proname
+      `);
+
+      const state = {
+        tables,
+        constraints,
+        indexes,
+        sequences,
+        triggers,
+        functions,
+      };
+
+      console.log(
+        `📊 ${label} - Tables: ${tables.length}, Constraints: ${constraints.length}, Indexes: ${indexes.length}, Sequences: ${sequences.length}, Triggers: ${triggers.length}, Functions: ${functions.length}`
+      );
+
+      return state;
+    }
+
+    /**
+     * Compares two database states and reports differences
+     */
+    function compareSourceDatabaseStates(
+      beforeState: DatabaseState,
+      afterState: DatabaseState
+    ): { isIdentical: boolean; differences: string[] } {
+      const differences: string[] = [];
+
+      // Compare tables
+      const beforeTables = new Set(beforeState.tables.map(t => t.table_name));
+      const afterTables = new Set(afterState.tables.map(t => t.table_name));
+
+      const addedTables = Array.from(afterTables).filter(t => !beforeTables.has(t));
+      const removedTables = Array.from(beforeTables).filter(t => !afterTables.has(t));
+
+      if (addedTables.length > 0) {
+        differences.push(`❌ ADDED TABLES: ${addedTables.join(', ')}`);
+      }
+      if (removedTables.length > 0) {
+        differences.push(`❌ REMOVED TABLES: ${removedTables.join(', ')}`);
+      }
+
+      // Compare constraints
+      const beforeConstraints = new Set(
+        beforeState.constraints.map(c => `${c.constraint_name}:${c.table_name}`)
+      );
+      const afterConstraints = new Set(
+        afterState.constraints.map(c => `${c.constraint_name}:${c.table_name}`)
+      );
+
+      const addedConstraints = Array.from(afterConstraints).filter(c => !beforeConstraints.has(c));
+      const removedConstraints = Array.from(beforeConstraints).filter(
+        c => !afterConstraints.has(c)
+      );
+
+      if (addedConstraints.length > 0) {
+        differences.push(`❌ ADDED CONSTRAINTS: ${addedConstraints.join(', ')}`);
+      }
+      if (removedConstraints.length > 0) {
+        differences.push(`❌ REMOVED CONSTRAINTS: ${removedConstraints.join(', ')}`);
+      }
+
+      // Compare indexes
+      const beforeIndexes = new Set(beforeState.indexes.map(i => `${i.indexname}:${i.tablename}`));
+      const afterIndexes = new Set(afterState.indexes.map(i => `${i.indexname}:${i.tablename}`));
+
+      const addedIndexes = Array.from(afterIndexes).filter(i => !beforeIndexes.has(i));
+      const removedIndexes = Array.from(beforeIndexes).filter(i => !afterIndexes.has(i));
+
+      if (addedIndexes.length > 0) {
+        differences.push(`❌ ADDED INDEXES: ${addedIndexes.join(', ')}`);
+      }
+      if (removedIndexes.length > 0) {
+        differences.push(`❌ REMOVED INDEXES: ${removedIndexes.join(', ')}`);
+      }
+
+      // Compare sequences
+      const beforeSequences = new Set(beforeState.sequences.map(s => s.sequence_name));
+      const afterSequences = new Set(afterState.sequences.map(s => s.sequence_name));
+
+      const addedSequences = Array.from(afterSequences).filter(s => !beforeSequences.has(s));
+      const removedSequences = Array.from(beforeSequences).filter(s => !afterSequences.has(s));
+
+      if (addedSequences.length > 0) {
+        differences.push(`❌ ADDED SEQUENCES: ${addedSequences.join(', ')}`);
+      }
+      if (removedSequences.length > 0) {
+        differences.push(`❌ REMOVED SEQUENCES: ${removedSequences.join(', ')}`);
+      }
+
+      // Compare triggers
+      const beforeTriggers = new Set(
+        beforeState.triggers.map(t => `${t.trigger_name}:${t.event_object_table}`)
+      );
+      const afterTriggers = new Set(
+        afterState.triggers.map(t => `${t.trigger_name}:${t.event_object_table}`)
+      );
+
+      const addedTriggers = Array.from(afterTriggers).filter(t => !beforeTriggers.has(t));
+      const removedTriggers = Array.from(beforeTriggers).filter(t => !afterTriggers.has(t));
+
+      if (addedTriggers.length > 0) {
+        differences.push(`❌ ADDED TRIGGERS: ${addedTriggers.join(', ')}`);
+      }
+      if (removedTriggers.length > 0) {
+        differences.push(`❌ REMOVED TRIGGERS: ${removedTriggers.join(', ')}`);
+      }
+
+      // Compare functions
+      const beforeFunctions = new Set(beforeState.functions.map(f => f.proname));
+      const afterFunctions = new Set(afterState.functions.map(f => f.proname));
+
+      const addedFunctions = Array.from(afterFunctions).filter(f => !beforeFunctions.has(f));
+      const removedFunctions = Array.from(beforeFunctions).filter(f => !afterFunctions.has(f));
+
+      if (addedFunctions.length > 0) {
+        differences.push(`❌ ADDED FUNCTIONS: ${addedFunctions.join(', ')}`);
+      }
+      if (removedFunctions.length > 0) {
+        differences.push(`❌ REMOVED FUNCTIONS: ${removedFunctions.join(', ')}`);
+      }
+
+      // Check for shadow artifacts specifically
+      const shadowTables = afterState.tables.filter(t => t.table_name.includes('shadow_'));
+      const shadowConstraints = afterState.constraints.filter(c =>
+        c.constraint_name.includes('shadow_')
+      );
+      const shadowIndexes = afterState.indexes.filter(i => i.indexname.includes('shadow_'));
+      const shadowSequences = afterState.sequences.filter(s => s.sequence_name.includes('shadow_'));
+
+      if (shadowTables.length > 0) {
+        differences.push(
+          `❌ SHADOW TABLES REMAIN: ${shadowTables.map(t => t.table_name).join(', ')}`
+        );
+      }
+      if (shadowConstraints.length > 0) {
+        differences.push(
+          `❌ SHADOW CONSTRAINTS REMAIN: ${shadowConstraints.map(c => `${c.constraint_name}:${c.table_name}`).join(', ')}`
+        );
+      }
+      if (shadowIndexes.length > 0) {
+        differences.push(
+          `❌ SHADOW INDEXES REMAIN: ${shadowIndexes.map(i => `${i.indexname}:${i.tablename}`).join(', ')}`
+        );
+      }
+      if (shadowSequences.length > 0) {
+        differences.push(
+          `❌ SHADOW SEQUENCES REMAIN: ${shadowSequences.map(s => s.sequence_name).join(', ')}`
+        );
+      }
+
+      return {
+        isIdentical: differences.length === 0,
+        differences,
+      };
+    }
+
+    // ===== CAPTURE INITIAL SOURCE DATABASE STATE =====
+    console.log('\n📊 PHASE 0: Capturing initial source database state...');
+
+    // Load test data first to establish baseline
+    await sourceLoader.loadTestData();
+    await destLoader.loadTestData();
+
+    const initialSourceState = await captureSourceDatabaseState(
+      'INITIAL (before any migration operations)'
+    );
+
     // Clean up any leftover sync triggers from previous test runs
     console.log('🧹 Cleaning up any existing sync triggers...');
     await destLoader.executeQuery(`
@@ -2409,10 +2646,6 @@ describe('TES Schema Migration Integration Tests', () => {
     `);
 
     console.log('✅ Existing sync triggers and write protection cleaned up');
-
-    // Load test data first
-    await sourceLoader.loadTestData();
-    await destLoader.loadTestData();
 
     // Modify source data to test that it gets migrated properly
     console.log('🔧 Modifying source data to test migration...');
@@ -2756,6 +2989,40 @@ describe('TES Schema Migration Integration Tests', () => {
     `);
     expect(finalShadowTables).toHaveLength(0);
     console.log('✅ No shadow tables remain after migration completion');
+
+    // ===== CRITICAL: SOURCE DATABASE STATE VERIFICATION =====
+    console.log('\n🔍 CRITICAL: Verifying complete source database restoration...');
+
+    const finalSourceState = await captureSourceDatabaseState('FINAL (after complete migration)');
+
+    const stateComparison = compareSourceDatabaseStates(initialSourceState, finalSourceState);
+
+    if (stateComparison.isIdentical) {
+      console.log('✅ PERFECT: Source database is in identical state to before migration!');
+      console.log(
+        '✅ PERFECT: Complete source database restoration verified - no shadow artifacts remain'
+      );
+    } else {
+      console.log('❌ CRITICAL ISSUE: Source database state has changed after migration!');
+      console.log('❌ DETAILED DIFFERENCES:');
+      stateComparison.differences.forEach(diff => {
+        console.log(`   ${diff}`);
+      });
+
+      console.log('\n🔍 ROOT CAUSE ANALYSIS:');
+      console.log(
+        '   The source database was not properly restored to its original state after dump creation.'
+      );
+      console.log(
+        '   This is the root cause of the double shadow artifact issue in subsequent migrations.'
+      );
+      console.log("   The migration system's source restoration logic has bugs.");
+
+      // Fail the test with detailed information
+      throw new Error(
+        `Source database restoration failed. Found ${stateComparison.differences.length} differences: ${stateComparison.differences.join('; ')}`
+      );
+    }
 
     console.log(
       '✅ Comprehensive two-phase migration with preserved tables test completed successfully'
