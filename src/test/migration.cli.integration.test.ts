@@ -163,15 +163,15 @@ describe('Migration CLI Integration Tests', () => {
 
     // Verify phase timing information is present
     expect(logContent).toContain('Phase 1: Creating source dump');
-    expect(logContent).toContain('Phase 2: Restoring source data to destination shadow schema');
-    expect(logContent).toContain('Phase 4: Performing atomic schema swap');
+    expect(logContent).toContain('Phase 2: Creating shadow tables in destination public schema');
+    expect(logContent).toContain('Phase 4: Performing atomic table swap');
 
     // Verify log contains timing information with ISO 8601 timestamps
     const timestampPattern = /\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\]/;
     expect(timestampPattern.test(logContent)).toBe(true);
 
     // Verify log contains duration information
-    expect(logContent).toMatch(/successfully \(\d+ms\)/);
+    expect(logContent).toMatch(/successfully \(\d+(\.\d+)?s\)|successfully \(\d+ms\)/);
 
     console.log('✅ Log file verification completed successfully');
     console.log(`Log file size: ${logContent.length} bytes`);

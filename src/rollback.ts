@@ -295,16 +295,28 @@ export class DatabaseRollback {
           );
           this.log(`• Restored table: ${backupTableName} → ${activeTableName}`);
 
-          // Rename associated sequences
-          const sequenceName = `${activeTableName}_id_seq`;
-          const backupSequenceName = `backup_${sequenceName}`;
-          try {
-            await client.query(
-              `ALTER SEQUENCE public."${backupSequenceName}" RENAME TO "${sequenceName}";`
-            );
-            this.log(`• Restored sequence: ${backupSequenceName} → ${sequenceName}`);
-          } catch (seqError) {
-            this.log(`⚠️  Could not restore sequence ${sequenceName}: ${seqError}`);
+          // Rename associated sequences - dynamically discover sequence names
+          const backupSequences = await client.query(
+            `
+            SELECT schemaname, sequencename
+            FROM pg_sequences 
+            WHERE schemaname = 'public' 
+            AND sequencename LIKE $1
+          `,
+            [`backup_${activeTableName}_%`]
+          );
+
+          for (const seqRow of backupSequences.rows) {
+            const backupSequenceName = seqRow.sequencename;
+            const activeSequenceName = backupSequenceName.replace('backup_', '');
+            try {
+              await client.query(
+                `ALTER SEQUENCE public."${backupSequenceName}" RENAME TO "${activeSequenceName}";`
+              );
+              this.log(`• Restored sequence: ${backupSequenceName} → ${activeSequenceName}`);
+            } catch (seqError) {
+              this.log(`⚠️  Could not restore sequence ${activeSequenceName}: ${seqError}`);
+            }
           }
 
           // Rename constraints (primary keys, foreign keys, etc.)
