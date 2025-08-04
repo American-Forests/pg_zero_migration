@@ -6,7 +6,7 @@
  * zero-downtime database migrations with real-time synchronization.
  */
 
-import { Pool } from 'pg';
+import { Pool, PoolClient } from 'pg';
 import { execa } from 'execa';
 import { unlinkSync, existsSync } from 'fs';
 import { join } from 'path';
@@ -1808,6 +1808,11 @@ export class DatabaseMigrator {
         `✅ Shadow tables created in public schema (${this.formatDuration(restoreDuration)})`
       );
 
+      // Clean up any write protection triggers that were restored with shadow tables
+      // These come from the source database dump and need to be removed so sync triggers can work
+      this.log('🧹 Removing write protection triggers from shadow tables...');
+      await this.removeWriteProtectionFromShadowTables(client);
+
       // Clean up dump file
       if (existsSync(dumpPath)) {
         unlinkSync(dumpPath);
@@ -3063,6 +3068,9 @@ export class DatabaseMigrator {
     const excludeMessage =
       excludedTables.length > 0 ? ` (excluding ${excludedTables.length} preserved tables)` : '';
     this.log(`🔒 Enabling write protection on destination database tables${excludeMessage}...`);
+    this.log(
+      `🔍 DEBUG: enableDestinationWriteProtection called with excludedTables: [${excludedTables.join(', ')}]`
+    );
 
     const client = await this.destPool.connect();
     try {
@@ -3091,10 +3099,23 @@ export class DatabaseMigrator {
 
       for (const row of result.rows) {
         const tableName = row.tablename;
+        this.log(`🔍 DEBUG: Processing table for write protection: ${tableName}`);
 
         // Skip preserved tables if they are in the excluded list
         if (excludedTableSet.has(tableName.toLowerCase())) {
           this.log(`🔓 Skipping write protection for preserved table: ${tableName}`);
+          continue;
+        }
+
+        // Skip shadow tables - they need to be writable by sync triggers
+        if (tableName.startsWith('shadow_')) {
+          this.log(`🔓 Skipping write protection for shadow table: ${tableName}`);
+          continue;
+        }
+
+        // Skip backup tables - they should not be modified during migration
+        if (tableName.startsWith('backup_')) {
+          this.log(`🔓 Skipping write protection for backup table: ${tableName}`);
           continue;
         }
 
@@ -3117,6 +3138,56 @@ export class DatabaseMigrator {
       throw error;
     } finally {
       client.release();
+    }
+  }
+
+  /**
+   * Remove write protection triggers from shadow tables that were restored from source dump
+   * Shadow tables need to be writable by sync triggers
+   */
+  private async removeWriteProtectionFromShadowTables(client: PoolClient): Promise<void> {
+    try {
+      // Find all shadow tables
+      const shadowTablesResult = await client.query(`
+        SELECT table_name 
+        FROM information_schema.tables 
+        WHERE table_schema = 'public' 
+        AND table_name LIKE 'shadow_%'
+      `);
+
+      let removedCount = 0;
+
+      for (const row of shadowTablesResult.rows) {
+        const tableName = row.table_name;
+
+        // Remove write protection triggers from this shadow table
+        const result = await client.query(
+          `
+          SELECT trigger_name 
+          FROM information_schema.triggers 
+          WHERE event_object_table = $1 
+          AND event_object_schema = 'public'
+          AND trigger_name LIKE 'migration_write_block_%'
+        `,
+          [tableName]
+        );
+
+        for (const triggerRow of result.rows) {
+          const triggerName = triggerRow.trigger_name;
+          await client.query(`DROP TRIGGER IF EXISTS "${triggerName}" ON public."${tableName}"`);
+          this.log(`🔓 Removed write protection trigger ${triggerName} from ${tableName}`);
+          removedCount++;
+        }
+      }
+
+      if (removedCount > 0) {
+        this.log(`✅ Removed ${removedCount} write protection triggers from shadow tables`);
+      } else {
+        this.log('ℹ️ No write protection triggers found on shadow tables');
+      }
+    } catch (error) {
+      this.logError('Failed to remove write protection from shadow tables', error);
+      throw error;
     }
   }
 

@@ -1944,7 +1944,10 @@ describe('TES Schema Migration Integration Tests', () => {
       SELECT sequence_name FROM information_schema.sequences 
       WHERE sequence_schema = 'public' AND sequence_name NOT LIKE 'backup_%'
     `);
-    console.log('Available sequences:', existingSequences.map(s => s.sequence_name));
+    console.log(
+      'Available sequences:',
+      existingSequences.map(s => s.sequence_name)
+    );
 
     // Only test sequences that actually exist in TES schema
     if (existingSequences.some(s => s.sequence_name === 'User_id_seq')) {
@@ -2166,7 +2169,47 @@ describe('TES Schema Migration Integration Tests', () => {
         END LOOP; 
       END $$;
     `);
-    console.log('✅ Existing sync triggers cleaned up');
+
+    // Clean up any leftover migration write protection functions from previous test runs
+    console.log('🧹 Cleaning up any existing write protection functions in destination...');
+    await destLoader.executeQuery(`DROP FUNCTION IF EXISTS migration_block_writes() CASCADE`);
+
+    // Also clean up write protection functions in source database
+    console.log('🧹 Cleaning up any existing write protection functions in source...');
+    await sourceLoader.executeQuery(`DROP FUNCTION IF EXISTS migration_block_writes() CASCADE`);
+
+    // Clean up any leftover write protection triggers
+    console.log('🧹 Cleaning up any existing write protection triggers in destination...');
+    await destLoader.executeQuery(`
+      DO $$ 
+      DECLARE 
+        r RECORD;
+      BEGIN 
+        FOR r IN (SELECT trigger_name, event_object_table 
+                  FROM information_schema.triggers 
+                  WHERE trigger_name LIKE 'migration_write_block_%') 
+        LOOP 
+          EXECUTE 'DROP TRIGGER IF EXISTS ' || r.trigger_name || ' ON public.' || r.event_object_table;
+        END LOOP; 
+      END $$;
+    `);
+
+    console.log('🧹 Cleaning up any existing write protection triggers in source...');
+    await sourceLoader.executeQuery(`
+      DO $$ 
+      DECLARE 
+        r RECORD;
+      BEGIN 
+        FOR r IN (SELECT trigger_name, event_object_table 
+                  FROM information_schema.triggers 
+                  WHERE trigger_name LIKE 'migration_write_block_%') 
+        LOOP 
+          EXECUTE 'DROP TRIGGER IF EXISTS ' || r.trigger_name || ' ON public.' || r.event_object_table;
+        END LOOP; 
+      END $$;
+    `);
+
+    console.log('✅ Existing sync triggers and write protection cleaned up');
 
     // Load test data first
     await sourceLoader.loadTestData();
@@ -2174,7 +2217,6 @@ describe('TES Schema Migration Integration Tests', () => {
 
     // Modify source data to test that it gets migrated properly
     console.log('🔧 Modifying source data to test migration...');
-    console.log('🔧 DEBUG: About to modify source data!');
 
     // Modify a NON-PRESERVED table (Municipality) to test source data migration
     await sourceLoader.executeQuery(`
@@ -2187,9 +2229,8 @@ describe('TES Schema Migration Integration Tests', () => {
       WHERE gid IN (1, 2)
     `);
     console.log('✅ Source data modified for migration testing');
-    console.log('🔧 DEBUG: Source data modification completed!');
 
-    // Debug: Verify source data modification worked
+    // Verify source data modification worked
     const modifiedSourceMunicipalities = await sourceLoader.executeQuery(`
       SELECT * FROM "Municipality" WHERE gid IN (1, 2) ORDER BY gid
     `);
@@ -2262,7 +2303,7 @@ describe('TES Schema Migration Integration Tests', () => {
     // Create migrator AFTER source data modification to ensure it sees the modified state
     const migrator = new DatabaseMigrator(sourceConfig, destConfig, preservedTables);
 
-    // Debug: Check source data right before prepare
+    // Check source data right before prepare
     const sourceUsersBeforePrepare = await sourceLoader.executeQuery(`
       SELECT * FROM "User" WHERE id IN (1, 2) ORDER BY id
     `);
@@ -2278,7 +2319,7 @@ describe('TES Schema Migration Integration Tests', () => {
     expect(prepareResult.timestamp).toBeDefined();
     console.log(`✅ Preparation completed with migration ID: ${prepareResult.migrationId}`);
 
-    // Debug: Verify source data is still modified after prepare
+    // Verify source data is still modified after prepare
     const sourceMunicipalitiesAfterPrepare = await sourceLoader.executeQuery(`
       SELECT * FROM "Municipality" WHERE gid IN (1, 2) ORDER BY gid
     `);
@@ -2305,7 +2346,7 @@ describe('TES Schema Migration Integration Tests', () => {
     `);
     expect(parseInt(shadowUserCount[0].count)).toBe(6); // 4 from source + 2 preserved
 
-    // Debug: Check what source data was actually copied to shadow tables
+    // Check what source data was actually copied to shadow tables
     const shadowSourceMunicipalities = await destLoader.executeQuery(`
       SELECT * FROM "shadow_Municipality" WHERE gid IN (1, 2) ORDER BY gid
     `);
@@ -2331,31 +2372,61 @@ describe('TES Schema Migration Integration Tests', () => {
 
     // Test 1: Modify preserved User data and verify immediate sync
     console.log('🔄 Modifying preserved User data...');
-    await destLoader.executeQuery(`
+
+    // First check what User IDs exist in the TES schema
+    const existingUsers = await destLoader.executeQuery(`
+      SELECT id, name FROM "User" ORDER BY id LIMIT 5
+    `);
+    console.log(
+      '🔍 Available User IDs in TES schema:',
+      existingUsers.map(u => ({ id: u.id, name: u.name }))
+    );
+
+    // Use the preserved User ID (should be id = 100) instead of fixture User ID
+    const testUserId = 100;
+
+    await destLoader.executeQuery(
+      `
       UPDATE "User" 
       SET name = 'Modified Preserved User 1', "updatedAt" = NOW() 
-      WHERE id = 100
-    `);
+      WHERE id = $1
+    `,
+      [testUserId]
+    );
 
     // Verify immediate sync to shadow tables
-    const syncedUser = await destLoader.executeQuery(`
-      SELECT * FROM "shadow_User" WHERE id = 100
-    `);
+    const syncedUser = await destLoader.executeQuery(
+      `
+      SELECT * FROM "shadow_User" WHERE id = $1
+    `,
+      [testUserId]
+    );
     expect(syncedUser).toHaveLength(1);
     expect(syncedUser[0].name).toBe('Modified Preserved User 1');
     console.log('✅ User modification synced to shadow tables');
 
     // Test 2: Add new preserved User and verify immediate sync
     console.log('🔄 Adding new preserved User...');
-    await destLoader.executeQuery(`
-      INSERT INTO "User" (id, name, email, "createdAt", "updatedAt") 
-      VALUES (102, 'New Preserved User', 'new.preserved@example.com', NOW(), NOW())
-    `);
+
+    // Find the next available ID by getting the max ID + 1
+    const maxIdResult = await destLoader.executeQuery(`SELECT MAX(id) as max_id FROM "User"`);
+    const nextUserId = (maxIdResult[0].max_id || 0) + 1;
+
+    await destLoader.executeQuery(
+      `
+      INSERT INTO "User" (id, name, email, "createdAt", "updatedAt", "hashedPassword", "role") 
+      VALUES ($1, 'New Preserved User', 'new.preserved@example.com', NOW(), NOW(), '$2b$10$test', 'USER')
+    `,
+      [nextUserId]
+    );
 
     // Verify immediate sync to shadow tables
-    const syncedNewUser = await destLoader.executeQuery(`
-      SELECT * FROM "shadow_User" WHERE id = 102
-    `);
+    const syncedNewUser = await destLoader.executeQuery(
+      `
+      SELECT * FROM "shadow_User" WHERE id = $1
+    `,
+      [nextUserId]
+    );
     expect(syncedNewUser).toHaveLength(1);
     expect(syncedNewUser[0].name).toBe('New Preserved User');
     console.log('✅ New User addition synced to shadow tables');
@@ -2459,27 +2530,22 @@ describe('TES Schema Migration Integration Tests', () => {
 
     console.log('✅ Source data migration and preserved data verified');
 
-    // Verify backup schema exists
-    const backupSchemas = await destLoader.executeQuery(`
-      SELECT schema_name FROM information_schema.schemata 
-      WHERE schema_name LIKE 'backup_%'
-      ORDER BY schema_name DESC
+    // Verify backup tables exist (table-swap strategy creates backup_ prefixed tables)
+    const backupTables = await destLoader.executeQuery(`
+      SELECT table_name FROM information_schema.tables
+      WHERE table_schema = 'public' AND table_name LIKE 'backup_%'
+      ORDER BY table_name
     `);
-    expect(backupSchemas.length).toBeGreaterThan(0);
-    console.log(`✅ Backup schema created: ${backupSchemas[0].schema_name}`);
+    expect(backupTables.length).toBeGreaterThan(0);
+    console.log(`✅ Backup tables created: ${backupTables.length} tables with backup_ prefix`);
 
-    // Verify shadow schema exists but is empty (ready for future migrations)
-    const finalShadowCheck = await destLoader.executeQuery(`
-      SELECT schema_name FROM information_schema.schemata WHERE schema_name = 'shadow'
+    // Verify no shadow tables exist in public schema after migration completion
+    const finalShadowTables = await destLoader.executeQuery(`
+      SELECT table_name FROM information_schema.tables 
+      WHERE table_schema = 'public' AND table_name LIKE 'shadow_%'
     `);
-    expect(finalShadowCheck).toHaveLength(1);
-
-    // Verify shadow schema is empty
-    const shadowTables = await destLoader.executeQuery(`
-      SELECT table_name FROM information_schema.tables WHERE table_schema = 'shadow'
-    `);
-    expect(shadowTables).toHaveLength(0);
-    console.log('✅ Shadow schema exists and is empty, ready for future migrations');
+    expect(finalShadowTables).toHaveLength(0);
+    console.log('✅ No shadow tables remain after migration completion');
 
     console.log(
       '✅ Comprehensive two-phase migration with preserved tables test completed successfully'
