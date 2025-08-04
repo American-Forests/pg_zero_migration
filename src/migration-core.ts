@@ -1986,17 +1986,6 @@ export class DatabaseMigrator {
       await client.query('BEGIN');
       await client.query('SET CONSTRAINTS ALL DEFERRED');
 
-      // Debug: Show all tables in public schema
-      const allTablesResult = await client.query(`
-        SELECT table_name 
-        FROM information_schema.tables 
-        WHERE table_schema = 'public' 
-        ORDER BY table_name
-      `);
-      this.log(
-        `🔍 Debug: Found ${allTablesResult.rows.length} total tables in public schema: ${allTablesResult.rows.map(r => r.table_name).join(', ')}`
-      );
-
       // Get list of all shadow tables to swap
       const shadowTablesResult = await client.query(`
         SELECT table_name 
@@ -2098,8 +2087,69 @@ export class DatabaseMigrator {
       // Step 2: Rename all shadow tables to become the active tables
       for (const shadowTable of shadowTables) {
         const originalTableName = shadowTable.replace('shadow_', '');
+
+        // 1. Rename the table first
         await client.query(`ALTER TABLE public."${shadowTable}" RENAME TO "${originalTableName}"`);
         this.log(`🚀 Renamed ${shadowTable} → ${originalTableName}`);
+
+        // 2. Rename sequences associated with this shadow table
+        const sequences = await client.query(
+          `
+          SELECT schemaname, sequencename
+          FROM pg_sequences 
+          WHERE schemaname = 'public' 
+          AND sequencename LIKE $1
+        `,
+          [`${shadowTable}_%`]
+        );
+
+        for (const seqRow of sequences.rows) {
+          const oldSeqName = seqRow.sequencename;
+          const newSeqName = oldSeqName.replace(shadowTable, originalTableName);
+          await client.query(`ALTER SEQUENCE public."${oldSeqName}" RENAME TO "${newSeqName}"`);
+          this.log(`🚀 Renamed sequence: ${oldSeqName} → ${newSeqName}`);
+        }
+
+        // 3. Rename constraints associated with this shadow table
+        const constraints = await client.query(
+          `
+          SELECT constraint_name
+          FROM information_schema.table_constraints 
+          WHERE table_schema = 'public' 
+          AND table_name = $1
+        `,
+          [originalTableName] // Use original name since table was already renamed
+        );
+
+        for (const constRow of constraints.rows) {
+          const oldConstName = constRow.constraint_name;
+          if (oldConstName.startsWith(shadowTable)) {
+            const newConstName = oldConstName.replace(shadowTable, originalTableName);
+            await client.query(
+              `ALTER TABLE public."${originalTableName}" RENAME CONSTRAINT "${oldConstName}" TO "${newConstName}"`
+            );
+            this.log(`🚀 Renamed constraint: ${oldConstName} → ${newConstName}`);
+          }
+        }
+
+        // 4. Rename indexes associated with this shadow table
+        const indexes = await client.query(
+          `
+          SELECT indexname 
+          FROM pg_indexes 
+          WHERE schemaname = 'public' 
+          AND tablename = $1
+          AND indexname LIKE $2
+        `,
+          [originalTableName, `${shadowTable}_%`]
+        );
+
+        for (const idxRow of indexes.rows) {
+          const oldIdxName = idxRow.indexname;
+          const newIdxName = oldIdxName.replace(shadowTable, originalTableName);
+          await client.query(`ALTER INDEX public."${oldIdxName}" RENAME TO "${newIdxName}"`);
+          this.log(`🚀 Renamed index: ${oldIdxName} → ${newIdxName}`);
+        }
       }
 
       await client.query('COMMIT');
@@ -2778,13 +2828,17 @@ export class DatabaseMigrator {
           }
 
           // Check if the sequence exists
+          const cleanedSequenceName = sequence.sequenceName
+            .replace(/^"?public"?\./, '')
+            .replace(/"/g, '');
+
           const sequenceExistsResult = await this.destPool.query(
             `SELECT EXISTS (
               SELECT 1 FROM information_schema.sequences 
               WHERE sequence_schema = 'public' 
               AND sequence_name = $1
             )`,
-            [sequence.sequenceName.replace(/^"?public"?\./, '').replace(/"/g, '')]
+            [cleanedSequenceName]
           );
 
           if (!sequenceExistsResult.rows[0].exists) {
@@ -2801,7 +2855,9 @@ export class DatabaseMigrator {
           const maxValue = parseInt(maxResult.rows[0].max_val);
           const nextValue = maxValue + 1;
 
-          await this.destPool.query(`SELECT setval('${sequence.sequenceName}', $1)`, [nextValue]);
+          await this.destPool.query(`SELECT setval('"public"."${cleanedSequenceName}"', $1)`, [
+            nextValue,
+          ]);
           this.log(
             `✅ Reset sequence ${sequence.sequenceName} to ${nextValue} (max value in ${tableName}.${sequence.columnName}: ${maxValue})`
           );
@@ -3068,9 +3124,6 @@ export class DatabaseMigrator {
     const excludeMessage =
       excludedTables.length > 0 ? ` (excluding ${excludedTables.length} preserved tables)` : '';
     this.log(`🔒 Enabling write protection on destination database tables${excludeMessage}...`);
-    this.log(
-      `🔍 DEBUG: enableDestinationWriteProtection called with excludedTables: [${excludedTables.join(', ')}]`
-    );
 
     const client = await this.destPool.connect();
     try {
@@ -3099,7 +3152,6 @@ export class DatabaseMigrator {
 
       for (const row of result.rows) {
         const tableName = row.tablename;
-        this.log(`🔍 DEBUG: Processing table for write protection: ${tableName}`);
 
         // Skip preserved tables if they are in the excluded list
         if (excludedTableSet.has(tableName.toLowerCase())) {

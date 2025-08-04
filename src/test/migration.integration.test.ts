@@ -13,6 +13,194 @@ import { DbTestLoaderMulti } from './test-loader-multi.js';
 import { DbTestLoader } from './test-loader.js';
 import { DatabaseMigrator, parseDatabaseUrl } from '../migration-core.js';
 import { DatabaseRollback } from '../rollback.js';
+import { DbSchemaParser } from '../util/db-schema-parser.js';
+import type { DatabaseSchema } from '../util/db-schema-types.js';
+
+/**
+ * Parse TES schema and extract table information for verification
+ */
+function parseSchemaForVerification(schemaPath: string): {
+  tableNames: string[];
+  tablesWithSequences: string[];
+  tablesWithoutSequences: string[];
+} {
+  const schema: DatabaseSchema = DbSchemaParser.parse(schemaPath);
+  const allTableNames = schema.getTableNames();
+
+  // Filter out system tables that should be ignored (PostGIS system tables, etc.)
+  const systemTablesToIgnore = ['spatial_ref_sys'];
+  const tableNames = allTableNames.filter(name => !systemTablesToIgnore.includes(name));
+
+  const tablesWithSequences: string[] = [];
+  const tablesWithoutSequences: string[] = [];
+
+  for (const tableName of tableNames) {
+    const table = schema.getTable(tableName);
+    if (!table) continue;
+
+    // Check if table has an auto-incrementing primary key
+    const hasAutoIncrementPK = table.columns.some(col => col.primaryKey && col.autoIncrement);
+
+    if (hasAutoIncrementPK) {
+      tablesWithSequences.push(tableName);
+    } else {
+      tablesWithoutSequences.push(tableName);
+    }
+  }
+
+  return {
+    tableNames,
+    tablesWithSequences,
+    tablesWithoutSequences,
+  };
+}
+
+/**
+ * Determine sequence suffix based on table schema
+ */
+function getSequenceSuffix(tableName: string, schema: DatabaseSchema): string {
+  const table = schema.getTable(tableName);
+  if (!table) return '_id_seq';
+
+  // Find the auto-incrementing primary key column
+  const autoIncrementCol = table.columns.find(col => col.primaryKey && col.autoIncrement);
+
+  if (!autoIncrementCol) return '_id_seq';
+
+  // Return suffix based on column name
+  return `_${autoIncrementCol.name}_seq`;
+}
+
+/**
+ * Verify that expected sequences exist and have the correct naming pattern
+ */
+async function verifySequencesExist(
+  loader: DbTestLoader,
+  schemaPath: string,
+  prefix: string = ''
+): Promise<void> {
+  console.log(`🔍 Verifying sequences exist with prefix: "${prefix}"`);
+
+  // Parse schema to get table information
+  const schema: DatabaseSchema = DbSchemaParser.parse(schemaPath);
+  const { tablesWithSequences, tablesWithoutSequences } = parseSchemaForVerification(schemaPath);
+
+  // Get all sequences in the public schema
+  const sequences = await loader.executeQuery(`
+    SELECT schemaname, sequencename 
+    FROM pg_sequences 
+    WHERE schemaname = 'public' 
+    ORDER BY sequencename
+  `);
+
+  const sequenceNames = sequences.map((seq: { sequencename: string }) => seq.sequencename);
+  console.log(`📊 Found sequences: ${sequenceNames.join(', ')}`);
+
+  // Log tables that don't have sequences for debugging
+  if (tablesWithoutSequences.length > 0) {
+    console.log(
+      `⏭️  Tables without sequences: ${tablesWithoutSequences.join(', ')} (composite keys or string IDs)`
+    );
+  }
+
+  // For each table with sequences, verify the sequence exists with correct prefix
+  for (const tableName of tablesWithSequences) {
+    const sequenceSuffix = getSequenceSuffix(tableName, schema);
+    const expectedSequenceName = `${prefix}${tableName}${sequenceSuffix}`;
+
+    const sequenceExists = sequenceNames.includes(expectedSequenceName);
+    if (!sequenceExists) {
+      throw new Error(
+        `❌ Expected sequence "${expectedSequenceName}" not found. Available sequences: ${sequenceNames.join(', ')}`
+      );
+    }
+    console.log(`✅ Sequence verified: ${expectedSequenceName}`);
+  }
+}
+
+/**
+ * Verify that expected constraints exist and have the correct naming pattern
+ */
+async function verifyConstraintsExist(
+  loader: DbTestLoader,
+  schemaPath: string,
+  prefix: string = ''
+): Promise<void> {
+  console.log(`🔍 Verifying constraints exist with prefix: "${prefix}"`);
+
+  // Parse schema to get table information
+  const { tableNames } = parseSchemaForVerification(schemaPath);
+
+  // Get all constraints in the public schema
+  const constraints = await loader.executeQuery(`
+    SELECT table_name, constraint_name, constraint_type
+    FROM information_schema.table_constraints 
+    WHERE table_schema = 'public' 
+    AND table_name LIKE '${prefix}%'
+    ORDER BY table_name, constraint_name
+  `);
+
+  console.log(`📊 Found ${constraints.length} constraints with prefix "${prefix}"`);
+
+  // Group constraints by table
+  const constraintsByTable: Record<string, { constraint_name: string; constraint_type: string }[]> =
+    {};
+  for (const constraint of constraints) {
+    const tableName = constraint.table_name;
+    if (!constraintsByTable[tableName]) {
+      constraintsByTable[tableName] = [];
+    }
+    constraintsByTable[tableName].push(constraint);
+  }
+
+  // For each expected table, verify primary key constraint exists
+  for (const tableName of tableNames) {
+    const prefixedTableName = `${prefix}${tableName}`;
+    const tableConstraints = constraintsByTable[prefixedTableName] || [];
+
+    // Verify primary key constraint exists
+    const primaryKeyConstraint = tableConstraints.find(c => c.constraint_type === 'PRIMARY KEY');
+    if (!primaryKeyConstraint) {
+      throw new Error(
+        `❌ Expected PRIMARY KEY constraint not found for table "${prefixedTableName}". Available constraints: ${tableConstraints.map(c => c.constraint_name).join(', ')}`
+      );
+    }
+
+    console.log(
+      `✅ Primary key constraint verified for ${prefixedTableName}: ${primaryKeyConstraint.constraint_name}`
+    );
+
+    // For foreign key tables, verify FK constraints exist
+    const foreignKeyConstraints = tableConstraints.filter(c => c.constraint_type === 'FOREIGN KEY');
+    if (foreignKeyConstraints.length > 0) {
+      console.log(
+        `✅ Foreign key constraints verified for ${prefixedTableName}: ${foreignKeyConstraints.map(c => c.constraint_name).join(', ')}`
+      );
+    }
+  }
+}
+
+/**
+ * Verify database objects after atomic table swap operations
+ */
+async function verifyAtomicSwapResults(
+  loader: DbTestLoader,
+  schemaPath: string,
+  swapDescription: string
+): Promise<void> {
+  console.log(`🔍 Verifying atomic swap results: ${swapDescription}`);
+
+  // Verify main tables exist with correct sequences and constraints
+  await verifySequencesExist(loader, schemaPath, '');
+  await verifyConstraintsExist(loader, schemaPath, '');
+
+  // Verify backup tables exist with correct sequences and constraints
+  // (backup tables should exist if this is after a migration)
+  await verifySequencesExist(loader, schemaPath, 'backup_');
+  await verifyConstraintsExist(loader, schemaPath, 'backup_');
+
+  console.log(`✅ Atomic swap verification completed: ${swapDescription}`);
+}
 
 describe('Database Migration Integration Tests', () => {
   // Test database configuration
@@ -55,17 +243,17 @@ describe('Database Migration Integration Tests', () => {
     const originalFixture = JSON.parse(fs.readFileSync(originalFixturePath, 'utf-8'));
 
     const modifiedFixture = {
-      User: originalFixture.User.map((user: any) => ({
+      User: originalFixture.User.map((user: { name: string; email: string }) => ({
         ...user,
         name: `${user.name} Modified`,
         email: user.email.replace('@', '+modified@'),
       })),
-      Post: originalFixture.Post.map((post: any) => ({
+      Post: originalFixture.Post.map((post: { title: string; content: string }) => ({
         ...post,
         title: `Modified ${post.title}`,
         content: `Modified: ${post.content}`,
       })),
-      Comment: originalFixture.Comment.map((comment: any) => ({
+      Comment: originalFixture.Comment.map((comment: { content: string }) => ({
         ...comment,
         content: `Modified: ${comment.content}`,
       })),
@@ -1672,6 +1860,17 @@ describe('TES Schema Migration Integration Tests', () => {
     await migrator.migrate();
     console.log('TES migration completed successfully');
 
+    // --- Verify Atomic Table Swap Results ---
+    console.log('🔍 Verifying atomic table swap sequences and constraints...');
+
+    // Verify main tables have correct sequences and constraints after shadow->main swap
+    const tesSchemaPath = path.resolve(__dirname, 'tes_schema.prisma');
+    await verifyAtomicSwapResults(
+      destLoader,
+      tesSchemaPath,
+      'Shadow tables renamed to main tables, original tables renamed to backup tables'
+    );
+
     // --- Backup Table Completeness Validation (after migration) ---
     console.log('Validating backup table completeness AFTER migration...');
     // Find backup tables in public schema (table-swap approach)
@@ -2474,6 +2673,17 @@ describe('TES Schema Migration Integration Tests', () => {
     expect(completeResult.success).toBe(true);
     console.log('✅ Migration swap completed successfully');
 
+    // --- Verify Preserved Table Migration Swap Results ---
+    console.log('🔍 Verifying preserved table migration sequences and constraints...');
+
+    // Verify final tables have correct sequences and constraints
+    const tesSchemaPath = path.resolve(__dirname, 'tes_schema.prisma');
+    await verifyAtomicSwapResults(
+      destLoader,
+      tesSchemaPath,
+      'Preserved table migration: shadow->main swap with preserved data retention'
+    );
+
     // Verify final data integrity and preserved data sync
     console.log('🔍 Verifying final data integrity...');
 
@@ -2648,6 +2858,19 @@ describe('TES Schema Migration Integration Tests', () => {
     console.log('🔄 Starting rollback operation...');
     await rollback.rollback(latestBackup.timestamp);
     console.log('✅ TES rollback completed');
+
+    // --- Verify Rollback Table Swap Results ---
+    console.log(
+      '🔍 Verifying rollback sequences and constraints after backup->main restoration...'
+    );
+
+    // Verify restored tables have correct sequences and constraints
+    const tesSchemaPath = path.resolve(__dirname, 'tes_schema.prisma');
+    await verifySequencesExist(destLoader, tesSchemaPath, '');
+    await verifyConstraintsExist(destLoader, tesSchemaPath, '');
+    console.log(
+      '✅ Rollback atomic swap verification completed: backup tables consumed, main tables restored'
+    );
 
     // CRITICAL VERIFICATION: Original geometry coordinates restored
     console.log(
