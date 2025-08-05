@@ -516,19 +516,6 @@ export class DatabaseMigrator {
       const phase5Duration = Date.now() - phase5StartTime;
       this.log(`✅ Phase 5 completed (${this.formatDuration(phase5Duration)})`);
 
-      // Phase 6: Reset sequences and recreate indexes
-      const phase6StartTime = Date.now();
-      this.log('🔢 Phase 6: Resetting sequences...');
-      await this.resetSequences(sourceTables);
-      const phase6Duration = Date.now() - phase6StartTime;
-      this.log(`✅ Phase 6 completed (${this.formatDuration(phase6Duration)})`);
-
-      const phase7StartTime = Date.now();
-      this.log('🗂️  Phase 7: Recreating indexes...');
-      await this.recreateIndexes(sourceTables);
-      const phase7Duration = Date.now() - phase7StartTime;
-      this.log(`✅ Phase 7 completed (${this.formatDuration(phase7Duration)})`);
-
       // Write protection was already disabled after table swap in Phase 4
 
       const totalCompletionDuration = Date.now() - completionStartTime;
@@ -1472,13 +1459,6 @@ export class DatabaseMigrator {
       // Phase 5: Cleanup sync triggers and validate consistency
       await this.cleanupSyncTriggersAndValidate(timestamp);
 
-      // Phase 6: Reset sequences and recreate indexes
-      this.log('🔢 Phase 6: Resetting sequences...');
-      await this.resetSequences(sourceTables);
-
-      this.log('🗂️  Phase 7: Recreating indexes...');
-      await this.recreateIndexes(sourceTables);
-
       // Disable destination write protection after all critical phases complete
       await this.disableDestinationWriteProtection();
 
@@ -2022,13 +2002,21 @@ export class DatabaseMigrator {
         );
 
         if (originalExists.rows[0].exists) {
-          // 1. Rename the table first
-          await client.query(
-            `ALTER TABLE public."${originalTableName}" RENAME TO "${backupTableName}"`
-          );
-          this.log(`📦 Renamed table: ${originalTableName} → ${backupTableName}`);
+          // IMPORTANT: Query for indexes, sequences, and constraints BEFORE renaming the table
+          // This ensures we only process the current main table's objects, not any leftover backup_ objects
 
-          // 2. Rename sequences associated with this table
+          // Get indexes associated with this table BEFORE renaming
+          const indexes = await client.query(
+            `
+            SELECT indexname
+            FROM pg_indexes 
+            WHERE schemaname = 'public' 
+            AND tablename = $1
+          `,
+            [originalTableName] // Query BEFORE table rename
+          );
+
+          // Get sequences associated with this table BEFORE renaming
           const sequences = await client.query(
             `
             SELECT schemaname, sequencename
@@ -2036,17 +2024,10 @@ export class DatabaseMigrator {
             WHERE schemaname = 'public' 
             AND sequencename LIKE $1
           `,
-            [`${originalTableName}_%`]
+            [`${originalTableName}_%`] // Query BEFORE table rename
           );
 
-          for (const seqRow of sequences.rows) {
-            const oldSeqName = seqRow.sequencename;
-            const newSeqName = oldSeqName.replace(originalTableName, backupTableName);
-            await client.query(`ALTER SEQUENCE public."${oldSeqName}" RENAME TO "${newSeqName}"`);
-            this.log(`📦 Renamed sequence: ${oldSeqName} → ${newSeqName}`);
-          }
-
-          // 3. Rename constraints associated with this table
+          // Get constraints associated with this table BEFORE renaming
           const constraints = await client.query(
             `
             SELECT constraint_name
@@ -2054,12 +2035,31 @@ export class DatabaseMigrator {
             WHERE table_schema = 'public' 
             AND table_name = $1
           `,
-            [backupTableName] // Use backup name since table was already renamed
+            [originalTableName] // Query BEFORE table rename
           );
 
+          // 1. Rename the table first
+          await client.query(
+            `ALTER TABLE public."${originalTableName}" RENAME TO "${backupTableName}"`
+          );
+          this.log(`📦 Renamed table: ${originalTableName} → ${backupTableName}`);
+
+          // 2. Rename sequences (using data from before table rename)
+          for (const seqRow of sequences.rows) {
+            const oldSeqName = seqRow.sequencename;
+            // Only rename sequences that don't already have backup_ prefix
+            if (!oldSeqName.startsWith('backup_')) {
+              const newSeqName = oldSeqName.replace(originalTableName, backupTableName);
+              await client.query(`ALTER SEQUENCE public."${oldSeqName}" RENAME TO "${newSeqName}"`);
+              this.log(`📦 Renamed sequence: ${oldSeqName} → ${newSeqName}`);
+            }
+          }
+
+          // 3. Rename constraints (using data from before table rename)
           for (const constRow of constraints.rows) {
             const oldConstName = constRow.constraint_name;
-            if (oldConstName.startsWith(originalTableName)) {
+            // Only rename constraints that don't already have backup_ prefix
+            if (!oldConstName.startsWith('backup_') && oldConstName.startsWith(originalTableName)) {
               const newConstName = oldConstName.replace(originalTableName, backupTableName);
               await client.query(
                 `ALTER TABLE public."${backupTableName}" RENAME CONSTRAINT "${oldConstName}" TO "${newConstName}"`
@@ -2068,23 +2068,20 @@ export class DatabaseMigrator {
             }
           }
 
-          // 4. Rename indexes associated with this table
-          const indexes = await client.query(
-            `
-            SELECT indexname
-            FROM pg_indexes 
-            WHERE schemaname = 'public' 
-            AND tablename = $1
-          `,
-            [backupTableName] // Use backup name since table was already renamed
-          );
-
+          // 4. Rename indexes (using data from before table rename)
           for (const idxRow of indexes.rows) {
             const oldIdxName = idxRow.indexname;
-            if (oldIdxName.startsWith(originalTableName)) {
-              const newIdxName = oldIdxName.replace(originalTableName, backupTableName);
+            // Only rename indexes that don't already have backup_ prefix
+            // Skip indexes that correspond to constraints we've already renamed (they get auto-renamed with constraints)
+            if (
+              !oldIdxName.startsWith('backup_') &&
+              !constraints.rows.some(c => c.constraint_name === oldIdxName)
+            ) {
+              const newIdxName = `backup_${oldIdxName}`;
               await client.query(`ALTER INDEX public."${oldIdxName}" RENAME TO "${newIdxName}"`);
               this.log(`📦 Renamed index: ${oldIdxName} → ${newIdxName}`);
+            } else if (constraints.rows.some(c => c.constraint_name === oldIdxName)) {
+              this.log(`⏩ Skipped index ${oldIdxName} (already renamed with constraint)`);
             }
           }
         }
@@ -2145,16 +2142,24 @@ export class DatabaseMigrator {
           FROM pg_indexes 
           WHERE schemaname = 'public' 
           AND tablename = $1
-          AND indexname LIKE $2
         `,
-          [originalTableName, `${shadowTable}_%`]
+          [originalTableName] // Use original name since table was already renamed
         );
 
         for (const idxRow of indexes.rows) {
           const oldIdxName = idxRow.indexname;
-          const newIdxName = oldIdxName.replace(shadowTable, originalTableName);
-          await client.query(`ALTER INDEX public."${oldIdxName}" RENAME TO "${newIdxName}"`);
-          this.log(`🚀 Renamed index: ${oldIdxName} → ${newIdxName}`);
+          // SAFETY CHECK: Only process indexes that have shadow_ prefix
+          // This ensures we only rename shadow indexes, not any leftover main table indexes
+          if (oldIdxName.startsWith('shadow_')) {
+            const newIdxName = oldIdxName.replace('shadow_', '');
+            await client.query(`ALTER INDEX public."${oldIdxName}" RENAME TO "${newIdxName}"`);
+            this.log(`🚀 Renamed index: ${oldIdxName} → ${newIdxName}`);
+          } else {
+            // Log unexpected non-shadow indexes for debugging
+            this.log(
+              `⚠️  Skipping non-shadow index on renamed table ${originalTableName}: ${oldIdxName}`
+            );
+          }
         }
       }
 

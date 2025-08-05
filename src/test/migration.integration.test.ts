@@ -2579,6 +2579,199 @@ describe('TES Schema Migration Integration Tests', () => {
       };
     }
 
+    /**
+     * Captures complete state of destination database for atomic swap comparison
+     */
+    async function captureDestinationDatabaseState(label: string): Promise<DatabaseState> {
+      console.log(`📊 Capturing destination database state: ${label}`);
+
+      // Get all tables in public schema (excluding system tables)
+      const tables = await destLoader.executeQuery(`
+        SELECT table_name 
+        FROM information_schema.tables 
+        WHERE table_schema = 'public' 
+        AND table_type = 'BASE TABLE'
+        AND table_name NOT IN ('spatial_ref_sys', 'geography_columns', 'geometry_columns')
+        ORDER BY table_name
+      `);
+
+      // Get all constraints
+      const constraints = await destLoader.executeQuery(`
+        SELECT constraint_name, table_name, constraint_type
+        FROM information_schema.table_constraints 
+        WHERE table_schema = 'public' 
+        AND table_name NOT IN ('spatial_ref_sys', 'geography_columns', 'geometry_columns')
+        ORDER BY constraint_name
+      `);
+
+      // Get all indexes
+      const indexes = await destLoader.executeQuery(`
+        SELECT indexname, tablename
+        FROM pg_indexes 
+        WHERE schemaname = 'public' 
+        AND tablename NOT IN ('spatial_ref_sys', 'geography_columns', 'geometry_columns')
+        ORDER BY indexname
+      `);
+
+      // Get all sequences
+      const sequences = await destLoader.executeQuery(`
+        SELECT sequence_name
+        FROM information_schema.sequences 
+        WHERE sequence_schema = 'public' 
+        ORDER BY sequence_name
+      `);
+
+      // Get all triggers (excluding system triggers)
+      const triggers = await destLoader.executeQuery(`
+        SELECT trigger_name, event_object_table
+        FROM information_schema.triggers 
+        WHERE trigger_schema = 'public'
+        AND event_object_table NOT IN ('spatial_ref_sys', 'geography_columns', 'geometry_columns')
+        ORDER BY trigger_name
+      `);
+
+      // Get all functions (excluding system functions)
+      const functions = await destLoader.executeQuery(`
+        SELECT proname
+        FROM pg_proc p
+        JOIN pg_namespace n ON p.pronamespace = n.oid
+        WHERE n.nspname = 'public'
+        AND proname NOT LIKE 'st_%'  -- Exclude PostGIS functions
+        ORDER BY proname
+      `);
+
+      const state = {
+        tables,
+        constraints,
+        indexes,
+        sequences,
+        triggers,
+        functions,
+      };
+
+      console.log(
+        `📊 ${label} - Tables: ${tables.length}, Constraints: ${constraints.length}, Indexes: ${indexes.length}, Sequences: ${sequences.length}, Triggers: ${triggers.length}, Functions: ${functions.length}`
+      );
+
+      return state;
+    }
+
+    /**
+     * Analyzes atomic table swap by comparing before/after destination states
+     */
+    function analyzeAtomicSwapTransformation(
+      beforeState: DatabaseState,
+      afterState: DatabaseState
+    ): {
+      swapResults: {
+        mainToBackupTransformations: string[];
+        shadowToMainTransformations: string[];
+        cleanupResults: string[];
+      };
+      issues: string[];
+      summary: string;
+    } {
+      const issues: string[] = [];
+      const mainToBackupTransformations: string[] = [];
+      const shadowToMainTransformations: string[] = [];
+      const cleanupResults: string[] = [];
+
+      // Identify tables that should have been swapped
+      const beforeMainTables = beforeState.tables.filter(
+        t => !t.table_name.startsWith('shadow_') && !t.table_name.startsWith('backup_')
+      );
+      const beforeShadowTables = beforeState.tables.filter(t => t.table_name.startsWith('shadow_'));
+
+      const afterMainTables = afterState.tables.filter(
+        t => !t.table_name.startsWith('shadow_') && !t.table_name.startsWith('backup_')
+      );
+      const afterBackupTables = afterState.tables.filter(t => t.table_name.startsWith('backup_'));
+      const afterShadowTables = afterState.tables.filter(t => t.table_name.startsWith('shadow_'));
+
+      // Check main -> backup transformations
+      for (const beforeMain of beforeMainTables) {
+        const expectedBackupName = `backup_${beforeMain.table_name}`;
+        const backupExists = afterBackupTables.some(t => t.table_name === expectedBackupName);
+
+        if (backupExists) {
+          mainToBackupTransformations.push(`✅ ${beforeMain.table_name} → ${expectedBackupName}`);
+        } else {
+          issues.push(
+            `❌ MISSING BACKUP: ${beforeMain.table_name} should have backup ${expectedBackupName}`
+          );
+        }
+      }
+
+      // Check shadow -> main transformations
+      for (const beforeShadow of beforeShadowTables) {
+        const expectedMainName = beforeShadow.table_name.replace('shadow_', '');
+        const mainExists = afterMainTables.some(t => t.table_name === expectedMainName);
+
+        if (mainExists) {
+          shadowToMainTransformations.push(`✅ ${beforeShadow.table_name} → ${expectedMainName}`);
+        } else {
+          issues.push(
+            `❌ MISSING MAIN: ${beforeShadow.table_name} should have become ${expectedMainName}`
+          );
+        }
+      }
+
+      // Check shadow cleanup
+      if (afterShadowTables.length === 0) {
+        cleanupResults.push('✅ All shadow tables successfully removed');
+      } else {
+        issues.push(
+          `❌ SHADOW CLEANUP FAILED: ${afterShadowTables.length} shadow tables remain: ${afterShadowTables.map(t => t.table_name).join(', ')}`
+        );
+      }
+
+      // Check for shadow artifacts in other objects
+      const shadowConstraints = afterState.constraints.filter(c =>
+        c.constraint_name.includes('shadow_')
+      );
+      const shadowIndexes = afterState.indexes.filter(i => i.indexname.includes('shadow_'));
+      const shadowSequences = afterState.sequences.filter(s => s.sequence_name.includes('shadow_'));
+
+      if (shadowConstraints.length > 0) {
+        issues.push(
+          `❌ SHADOW CONSTRAINTS REMAIN: ${shadowConstraints.map(c => `${c.constraint_name}:${c.table_name}`).join(', ')}`
+        );
+      } else {
+        cleanupResults.push('✅ All shadow constraints successfully cleaned up');
+      }
+
+      if (shadowIndexes.length > 0) {
+        issues.push(
+          `❌ SHADOW INDEXES REMAIN: ${shadowIndexes.map(i => `${i.indexname}:${i.tablename}`).join(', ')}`
+        );
+      } else {
+        cleanupResults.push('✅ All shadow indexes successfully cleaned up');
+      }
+
+      if (shadowSequences.length > 0) {
+        issues.push(
+          `❌ SHADOW SEQUENCES REMAIN: ${shadowSequences.map(s => s.sequence_name).join(', ')}`
+        );
+      } else {
+        cleanupResults.push('✅ All shadow sequences successfully cleaned up');
+      }
+
+      const summary =
+        issues.length === 0
+          ? `✅ ATOMIC SWAP SUCCESSFUL: ${mainToBackupTransformations.length} main→backup, ${shadowToMainTransformations.length} shadow→main transformations completed with full cleanup`
+          : `❌ ATOMIC SWAP ISSUES: ${issues.length} problems detected`;
+
+      return {
+        swapResults: {
+          mainToBackupTransformations,
+          shadowToMainTransformations,
+          cleanupResults,
+        },
+        issues,
+        summary,
+      };
+    }
+
     // ===== CAPTURE INITIAL SOURCE DATABASE STATE =====
     console.log('\n📊 PHASE 0: Capturing initial source database state...');
 
@@ -2899,12 +3092,61 @@ describe('TES Schema Migration Integration Tests', () => {
     console.log('🔄 Creating new migrator instance to test state persistence...');
     const newMigrator = new DatabaseMigrator(sourceConfig, destConfig, preservedTables);
 
+    // ===== PRE-SWAP STATE CAPTURE =====
+    console.log('\n📊 STEP 6.5: Capturing destination database state before atomic swap...');
+
+    const preSwapDestState = captureDestinationDatabaseState(
+      'PRE-SWAP (after prepare, before completeMigration)'
+    );
+
     // Step 7: Run completeMigration with preserved tables
     console.log('🔧 Running completeMigration with preserved tables...');
     const completeResult = await newMigrator.completeMigration(preservedTables);
 
     expect(completeResult.success).toBe(true);
     console.log('✅ Migration swap completed successfully');
+
+    // ===== POST-SWAP STATE CAPTURE AND VERIFICATION =====
+    console.log('\n📊 STEP 8: Capturing destination database state after atomic swap...');
+
+    const postSwapDestState = captureDestinationDatabaseState(
+      'POST-SWAP (after completeMigration)'
+    );
+
+    console.log('\n🔍 ANALYZING ATOMIC TABLE SWAP TRANSFORMATION...');
+    const swapAnalysis = analyzeAtomicSwapTransformation(
+      await preSwapDestState,
+      await postSwapDestState
+    );
+
+    // Report swap analysis results
+    console.log('\n🔄 ATOMIC SWAP TRANSFORMATION RESULTS:');
+    console.log('📋 Main → Backup Transformations:');
+    swapAnalysis.swapResults.mainToBackupTransformations.forEach(transformation =>
+      console.log(`   ${transformation}`)
+    );
+
+    console.log('\n📋 Shadow → Main Transformations:');
+    swapAnalysis.swapResults.shadowToMainTransformations.forEach(transformation =>
+      console.log(`   ${transformation}`)
+    );
+
+    console.log('\n📋 Cleanup Results:');
+    swapAnalysis.swapResults.cleanupResults.forEach(result => console.log(`   ${result}`));
+
+    if (swapAnalysis.issues.length > 0) {
+      console.log('\n❌ ATOMIC SWAP ISSUES DETECTED:');
+      swapAnalysis.issues.forEach(issue => console.log(`   ${issue}`));
+    }
+
+    console.log(`\n${swapAnalysis.summary}`);
+
+    // Assert that the atomic swap was successful
+    expect(swapAnalysis.issues).toHaveLength(0);
+    expect(swapAnalysis.swapResults.mainToBackupTransformations.length).toBeGreaterThan(0);
+    expect(swapAnalysis.swapResults.shadowToMainTransformations.length).toBeGreaterThan(0);
+
+    console.log('✅ Atomic table swap verification completed successfully');
 
     // --- Verify Preserved Table Migration Swap Results ---
     console.log('🔍 Verifying preserved table migration sequences and constraints...');
