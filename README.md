@@ -18,7 +18,7 @@ The Database Migration Tool provides enterprise-grade database migration capabil
 
 ## How It Works
 
-The migration process follows a carefully orchestrated 8-phase approach:
+The migration process follows a carefully orchestrated 5-phase approach:
 
 ### Phase 1: Create Source Dump
 
@@ -38,25 +38,16 @@ The migration process follows a carefully orchestrated 8-phase approach:
 
 ### Phase 4: Perform Atomic Table Swap
 
-1. **Backup Creation**: Renames current tables to "backup_" prefix
-2. **Table Activation**: Renames shadow tables to become the new active tables
+1. **Backup Creation**: Renames current tables to "backup_" prefix, including all sequences, constraints, and indexes
+2. **Table Activation**: Renames shadow tables to become the new active tables with all associated database objects
 3. **Atomic Transaction**: All table renames happen in a single transaction with deferred constraints
+4. **Automatic Object Handling**: Sequences, indexes, and constraints are automatically renamed as part of the atomic swap
 
-### Phase 5: Cleanup Sync Triggers and Validate Consistency
+### Phase 5: Cleanup and Finalization
 
 1. **Trigger Cleanup**: Removes real-time sync triggers from preserved tables
-2. **Data Validation**: Validates consistency between migrated data
-
-### Phase 6: Reset Sequences
-
-1. **Sequence Synchronization**: Synchronizes all sequence values to match source database
-2. **Sequence Validation**: Verifies sequence values are correctly set
-
-### Phase 7: Recreate Indexes
-
-1. **Index Recreation**: Rebuilds indexes for optimal performance
-2. **Spatial Index Handling**: Special handling for PostGIS spatial indexes
-3. **Constraint Re-enabling**: Restores foreign key constraints
+2. **Write Protection Removal**: Disables destination database write protection
+3. **Migration Validation**: Validates atomic swap completion and data consistency
 
 ## Destination Database Protection
 
@@ -121,7 +112,7 @@ These protections ensure that even large-scale migrations can be performed safel
 - Comprehensive pre-migration validation
 - Automatic backup creation before schema changes
 - Foreign key constraint handling
-- Sequence value preservation
+- Sequence and index preservation during atomic swap
 - Data verification at each step
 
 ### Enterprise Features
@@ -146,7 +137,7 @@ npm run migration -- start \
   --preserved-tables users,sessions
 ```
 
-This executes all phases (1-7) sequentially in a single operation.
+This executes all phases (1-5) sequentially in a single operation.
 
 ### Two-Phase Mode (Recommended for Production)
 
@@ -185,8 +176,8 @@ npm run migration -- swap \
 
 **What happens during swap:**
 - Performs atomic table swap (typically 40-80ms downtime)
-- Cleans up sync triggers
-- Resets sequences and recreates indexes
+- Cleans up sync triggers and validates consistency
+- Removes write protection and finalizes migration
 - Validates migration completion
 
 #### Monitoring Between Phases
