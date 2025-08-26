@@ -15,6 +15,8 @@ This file provides guidance to Copilot when working with code in this repository
 At the start of each session, read:
 1. Any `**/README.md` docs across the project
 2. Any `**/README.*.md` docs across the project
+3. TES prisma schema in `src/test/tes_schema.prisma`
+4. TES fixture data in `src/test/tes_fixture.json`
 
 ## Architecture
 

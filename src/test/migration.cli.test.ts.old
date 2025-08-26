@@ -34,7 +34,8 @@ describe('Migration CLI Integration Tests', () => {
     console.log(`Setting up CLI test databases: ${testDbNameSource} -> ${testDbNameDest}`);
 
     // Initialize the multi-loader for TES schema
-    multiLoader = new DbTestLoaderMulti('tes', expectedSourceUrl, expectedDestUrl);
+    const tesSchemaPath = path.resolve(__dirname, 'tes_schema.prisma');
+    multiLoader = new DbTestLoaderMulti(expectedSourceUrl, expectedDestUrl, tesSchemaPath);
 
     // Initialize loaders and create databases
     multiLoader.initializeLoaders();

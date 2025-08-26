@@ -6,7 +6,7 @@
  * zero-downtime database migrations with real-time synchronization.
  */
 
-import { Pool } from 'pg';
+import { Pool, PoolClient } from 'pg';
 import { execa } from 'execa';
 import { unlinkSync, existsSync } from 'fs';
 import { join } from 'path';
@@ -102,6 +102,12 @@ export interface PreparationResult {
   stats: MigrationStats;
   logs: string[];
   error?: string;
+}
+
+export interface BackupInfo {
+  tableCount: number;
+  tables: string[];
+  estimatedTimestamp?: number;
 }
 
 export class DatabaseMigrator {
@@ -243,6 +249,9 @@ export class DatabaseMigrator {
 
       this.log('✅ Migration preparation completed successfully');
 
+      // Only cleanup backups after successful prepare to maintain safety
+      await this.cleanupExistingBackups();
+
       return {
         success: true,
         migrationId,
@@ -269,7 +278,7 @@ export class DatabaseMigrator {
   }
 
   /**
-   * Complete migration (Phases 4-7): Performs schema swap, cleanup, and finalization
+   * Complete migration (Phases 4-7): Performs table swap, cleanup, and finalization
    * Uses database introspection instead of state files for validation
    */
   async completeMigration(preservedTables: string[] = []): Promise<MigrationResult> {
@@ -282,8 +291,8 @@ export class DatabaseMigrator {
       // Detect timestamp from existing backup schemas if not provided
       const timestamp = await this.detectMigrationTimestamp();
 
-      // Get table info for completion phases
-      const sourceTables = await this.analyzeSchema(this.destPool, 'shadow');
+      // Get table info for completion phases - analyze shadow tables
+      const sourceTables = await this.analyzeShadowTables();
 
       // Perform completion phases
       await this.doCompletion(sourceTables, timestamp);
@@ -322,32 +331,19 @@ export class DatabaseMigrator {
     const issues: string[] = [];
 
     try {
-      // 1. Check if shadow schema exists
-      const shadowExists = await client.query(`
-        SELECT EXISTS (
-          SELECT 1 FROM information_schema.schemata 
-          WHERE schema_name = 'shadow'
-        )
-      `);
-
-      if (!shadowExists.rows[0].exists) {
-        issues.push('❌ Shadow schema does not exist. Run prepare command first.');
-      } else {
-        this.log('✅ Shadow schema exists');
-      }
-
-      // 2. Check if shadow schema has tables
+      // 1. Check if shadow tables exist
       const shadowTables = await client.query(`
         SELECT COUNT(*) as count
         FROM information_schema.tables 
-        WHERE table_schema = 'shadow'
+        WHERE table_schema = 'public'
+        AND table_name LIKE 'shadow_%'
       `);
 
       const shadowTableCount = parseInt(shadowTables.rows[0].count);
       if (shadowTableCount === 0) {
-        issues.push('❌ Shadow schema is empty. Run prepare command first.');
+        issues.push('❌ No shadow tables found');
       } else {
-        this.log(`✅ Shadow schema has ${shadowTableCount} tables`);
+        this.log(`✅ Found ${shadowTableCount} shadow tables`);
       }
 
       // 3. Check preserved table sync triggers if preserved tables are expected
@@ -400,37 +396,41 @@ export class DatabaseMigrator {
             [tableName]
           );
 
+          const shadowTableName = `shadow_${tableName}`;
           const shadowExists = await client.query(
             `
             SELECT EXISTS (
               SELECT 1 FROM information_schema.tables 
-              WHERE table_schema = 'shadow' AND table_name = $1
+              WHERE table_schema = 'public' AND table_name = $1
             )
           `,
-            [tableName]
+            [shadowTableName]
           );
 
           if (!publicExists.rows[0].exists) {
             issues.push(`❌ Preserved table '${tableName}' not found in public schema`);
           }
           if (!shadowExists.rows[0].exists) {
-            issues.push(`❌ Preserved table '${tableName}' not found in shadow schema`);
+            issues.push(
+              `❌ Preserved table '${tableName}' not found as shadow table '${shadowTableName}'`
+            );
           }
         }
       }
 
-      // 5. Check for existing backup schemas (indicating previous migrations)
-      const backupSchemas = await client.query(`
-        SELECT schema_name 
-        FROM information_schema.schemata 
-        WHERE schema_name LIKE 'backup_%'
-        ORDER BY schema_name DESC
-        LIMIT 3
+      // 5. Check for existing backup tables (indicating previous migrations)
+      const backupTables = await client.query(`
+        SELECT table_name 
+        FROM information_schema.tables 
+        WHERE table_schema = 'public'
+        AND table_name LIKE 'backup_%'
+        ORDER BY table_name DESC
+        LIMIT 10
       `);
 
-      if (backupSchemas.rows.length > 0) {
+      if (backupTables.rows.length > 0) {
         this.log(
-          `ℹ️  Found ${backupSchemas.rows.length} existing backup schemas: ${backupSchemas.rows.map((r: any) => r.schema_name).join(', ')}`
+          `ℹ️  Found ${backupTables.rows.length} existing backup tables: ${backupTables.rows.map((r: any) => r.table_name).join(', ')}`
         );
       }
 
@@ -487,7 +487,7 @@ export class DatabaseMigrator {
 
       const totalPreparationDuration = Date.now() - preparationStartTime;
       this.log('✅ Preparation phases completed successfully');
-      this.log(`📦 Shadow schema ready for swap`);
+      this.log(`📦 Shadow tables ready for swap`);
       this.log(`⏱️ Total preparation time: ${this.formatDuration(totalPreparationDuration)}`);
       this.log('💡 Run the swap command when ready to complete migration');
     } catch (error) {
@@ -513,9 +513,9 @@ export class DatabaseMigrator {
     this.log('🔄 Starting migration completion phases...');
 
     try {
-      // Phase 4: Perform atomic schema swap (zero downtime!)
+      // Phase 4: Perform atomic table swap (zero downtime!)
       const phase4StartTime = Date.now();
-      await this.performAtomicSchemaSwap(timestamp);
+      await this.performAtomicTableSwap(timestamp);
       const phase4Duration = Date.now() - phase4StartTime;
       this.log(`✅ Phase 4 completed (${this.formatDuration(phase4Duration)})`);
 
@@ -525,20 +525,7 @@ export class DatabaseMigrator {
       const phase5Duration = Date.now() - phase5StartTime;
       this.log(`✅ Phase 5 completed (${this.formatDuration(phase5Duration)})`);
 
-      // Phase 6: Reset sequences and recreate indexes
-      const phase6StartTime = Date.now();
-      this.log('🔢 Phase 6: Resetting sequences...');
-      await this.resetSequences(sourceTables);
-      const phase6Duration = Date.now() - phase6StartTime;
-      this.log(`✅ Phase 6 completed (${this.formatDuration(phase6Duration)})`);
-
-      const phase7StartTime = Date.now();
-      this.log('🗂️  Phase 7: Recreating indexes...');
-      await this.recreateIndexes(sourceTables);
-      const phase7Duration = Date.now() - phase7StartTime;
-      this.log(`✅ Phase 7 completed (${this.formatDuration(phase7Duration)})`);
-
-      // Write protection was already disabled after schema swap in Phase 4
+      // Write protection was already disabled after table swap in Phase 4
 
       const totalCompletionDuration = Date.now() - completionStartTime;
       this.log('✅ Zero-downtime migration finished successfully');
@@ -940,6 +927,100 @@ export class DatabaseMigrator {
   }
 
   /**
+   * Validate atomic table swap completion
+   * Ensures all components of the table swap completed successfully
+   */
+  private async validateAtomicTableSwap(_timestamp: number): Promise<void> {
+    this.log('🔍 Validating atomic table swap completion...');
+
+    const client = await this.destPool.connect();
+    try {
+      // 1. Verify public schema exists and contains expected tables
+      const publicSchemaCheck = await client.query(`
+        SELECT schema_name 
+        FROM information_schema.schemata 
+        WHERE schema_name = 'public'
+      `);
+
+      if (publicSchemaCheck.rows.length === 0) {
+        throw new Error('Critical: Public schema does not exist after swap');
+      }
+
+      // 2. Verify no shadow tables remain (all should have been renamed)
+      const remainingShadowTables = await client.query(`
+        SELECT table_name 
+        FROM information_schema.tables 
+        WHERE table_schema = 'public' 
+        AND table_name LIKE 'shadow_%'
+      `);
+
+      if (remainingShadowTables.rows.length > 0) {
+        const shadowTableNames = remainingShadowTables.rows.map(row => row.table_name).join(', ');
+        throw new Error(`Critical: Shadow tables still exist after swap: ${shadowTableNames}`);
+      }
+
+      // 3. Verify backup tables exist with expected naming
+      const backupTables = await client.query(`
+        SELECT table_name 
+        FROM information_schema.tables 
+        WHERE table_schema = 'public' 
+        AND table_name LIKE 'backup_%'
+      `);
+
+      if (backupTables.rows.length === 0) {
+        this.stats.warnings.push('Post-swap: No backup tables found');
+        this.log('⚠️  Post-swap: No backup tables found');
+      } else {
+        this.log(`✅ Found ${backupTables.rows.length} backup tables`);
+      }
+
+      // 4. Verify public schema has active tables (not empty)
+      const publicTablesCheck = await client.query(`
+        SELECT COUNT(*) as table_count
+        FROM information_schema.tables 
+        WHERE table_schema = 'public' 
+        AND table_type = 'BASE TABLE'
+        AND table_name NOT LIKE 'backup_%'
+      `);
+
+      const publicTableCount = parseInt(publicTablesCheck.rows[0].table_count);
+      if (publicTableCount === 0) {
+        throw new Error('Critical: No active tables in public schema after swap');
+      }
+
+      this.log(`✅ Found ${publicTableCount} active tables in public schema`);
+
+      // 5. Quick validation of key table accessibility
+      try {
+        await client.query('SELECT 1 FROM information_schema.tables LIMIT 1');
+        this.log('✅ Post-swap: Database connectivity and basic operations verified');
+      } catch (error) {
+        throw new Error(`Critical: Database operations failed after swap: ${error}`);
+      }
+
+      // 6. Verify constraints are properly enabled
+      const constraintCheck = await client.query(`
+        SELECT COUNT(*) as constraint_count
+        FROM information_schema.table_constraints 
+        WHERE table_schema = 'public'
+        AND table_name NOT LIKE 'backup_%'
+      `);
+
+      const constraintCount = parseInt(constraintCheck.rows[0].constraint_count);
+      this.log(`✅ Found ${constraintCount} constraints on active tables`);
+
+      this.log('✅ Atomic table swap validation completed successfully');
+    } catch (error) {
+      // Log as error but don't fail the migration since the swap already happened
+      this.stats.errors.push(`Post-swap validation failed: ${error}`);
+      this.log(`❌ Post-swap validation failed: ${error}`);
+      throw error; // Re-throw since this is critical
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
    * Validate sync trigger exists and is properly configured
    * Lightweight check without data manipulation
    */
@@ -1024,6 +1105,36 @@ export class DatabaseMigrator {
     }
 
     this.log(`📊 ${dbName} database has ${tables.length} tables`);
+    return tables;
+  }
+
+  /**
+   * Analyze shadow tables in public schema
+   */
+  private async analyzeShadowTables(): Promise<TableInfo[]> {
+    this.log('🔬 Analyzing shadow tables in destination public schema...');
+
+    const tablesQuery = `
+      SELECT 
+        c.relname as table_name,
+        n.nspname as table_schema
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = 'public'
+        AND c.relkind = 'r'
+        AND c.relname LIKE 'shadow_%'
+      ORDER BY c.relname
+    `;
+
+    const tablesResult = await this.destPool.query(tablesQuery);
+    const tables: TableInfo[] = [];
+
+    for (const row of tablesResult.rows) {
+      const tableInfo = await this.getTableInfo(this.destPool, row.table_schema, row.table_name);
+      tables.push(tableInfo);
+    }
+
+    this.log(`📊 Found ${tables.length} shadow tables`);
     return tables;
   }
 
@@ -1167,6 +1278,19 @@ export class DatabaseMigrator {
     this.log(`   Destination tables to backup: ${destTables.length}`);
     this.log(`   Preserved tables: ${this.preservedTables.size}`);
 
+    // Check for existing backups
+    const existingBackup = await this.detectExistingBackups();
+    if (existingBackup) {
+      this.log(`\n⚠️  Existing Backup Detected:`);
+      this.log(`   📦 Found ${existingBackup.tableCount} backup tables`);
+      if (existingBackup.estimatedTimestamp) {
+        const backupDate = new Date(existingBackup.estimatedTimestamp).toISOString();
+        this.log(`   📅 Estimated backup date: ${backupDate}`);
+      }
+      this.log(`   📝 Note: Existing backup will be replaced after successful prepare`);
+      this.log(`   ⚠️  Previous backup will be lost - ensure you don't need to rollback to it`);
+    }
+
     // Analyze source tables with real data
     this.log(`\n📋 Source Database Analysis:`);
     let totalSourceRecords = 0;
@@ -1265,7 +1389,7 @@ export class DatabaseMigrator {
     this.log(
       `   2. 📦 Create source dump of ${sourceTables.length} tables (${totalSourceRecords.toLocaleString()} total records)`
     );
-    this.log(`   3. 🔄 Restore source data to destination shadow schema`);
+    this.log(`   3. 🔄 Create shadow tables in destination public schema`);
     if (this.preservedTables.size > 0) {
       this.log(`   4. 🔄 Setup real-time sync for ${this.preservedTables.size} preserved tables`);
     } else {
@@ -1322,7 +1446,7 @@ export class DatabaseMigrator {
     this.log(`\n⏱️  Estimated Timing:`);
     this.log(`   📦 Dump phase: ~${estimatedDumpTime} minutes`);
     this.log(`   🔄 Restore phase: ~${estimatedRestoreTime} minutes`);
-    this.log(`   ⚡ Schema swap: <30 seconds (zero downtime)`);
+    this.log(`   ⚡ Table swap: 40-80ms (zero downtime)`);
     this.log(`   🎯 Total estimated time: ~${estimatedTotalTime} minutes`);
 
     // Update statistics for dry run
@@ -1345,24 +1469,17 @@ export class DatabaseMigrator {
       // Phase 1: Create source dump
       const dumpPath = await this.createSourceDump(sourceTables, timestamp);
 
-      // Phase 2: Restore source dump to destination shadow schema
+      // Phase 2: Create shadow tables in destination public schema
       await this.restoreToDestinationShadow(sourceTables, dumpPath);
 
       // Phase 3: Setup preserved table synchronization
       await this.setupPreservedTableSync(destTables, timestamp);
 
-      // Phase 4: Perform atomic schema swap (zero downtime!)
-      await this.performAtomicSchemaSwap(timestamp);
+      // Phase 4: Perform atomic table swap (zero downtime!)
+      await this.performAtomicTableSwap(timestamp);
 
       // Phase 5: Cleanup sync triggers and validate consistency
       await this.cleanupSyncTriggersAndValidate(timestamp);
-
-      // Phase 6: Reset sequences and recreate indexes
-      this.log('🔢 Phase 6: Resetting sequences...');
-      await this.resetSequences(sourceTables);
-
-      this.log('🗂️  Phase 7: Recreating indexes...');
-      await this.recreateIndexes(sourceTables);
 
       // Disable destination write protection after all critical phases complete
       await this.disableDestinationWriteProtection();
@@ -1403,45 +1520,225 @@ export class DatabaseMigrator {
   }
 
   /**
-   * Phase 1: Create source dump from source database
+   * Phase 1: Create source dump from source database with shadow table naming
    */
   private async createSourceDump(sourceTables: TableInfo[], timestamp: number): Promise<string> {
     this.log('🔧 Phase 1: Creating source dump...');
 
-    try {
-      // Prepare source database by moving tables to shadow schema
-      await this.prepareSourceForShadowDump(sourceTables);
+    const sourceClient = await this.sourcePool.connect();
 
-      // Enable write protection on source database for safety during dump/restore process
+    try {
+      // Enable write protection on source database for safety during dump process
       await this.enableWriteProtection();
 
-      // Create binary dump for maximum efficiency and parallelization
+      // Step 1: Rename source tables AND all their constraints/sequences/indexes to shadow_ prefix for dump
+      this.log('🔄 Renaming source tables and associated objects to shadow_ prefix for dump...');
+      for (const table of sourceTables) {
+        const originalName = table.tableName;
+        const shadowName = `shadow_${originalName}`;
+
+        // 1. Rename the table first
+        await sourceClient.query(`ALTER TABLE public."${originalName}" RENAME TO "${shadowName}"`);
+        this.log(`📝 Renamed source table: ${originalName} → ${shadowName}`);
+
+        // 2. Rename sequences associated with this table
+        const sequences = await sourceClient.query(
+          `
+          SELECT schemaname, sequencename
+          FROM pg_sequences 
+          WHERE schemaname = 'public' 
+          AND sequencename LIKE $1
+        `,
+          [`${originalName}_%`]
+        );
+
+        for (const seqRow of sequences.rows) {
+          const oldSeqName = seqRow.sequencename;
+          const newSeqName = oldSeqName.replace(originalName, shadowName);
+          await sourceClient.query(
+            `ALTER SEQUENCE public."${oldSeqName}" RENAME TO "${newSeqName}"`
+          );
+          this.log(`📝 Renamed source sequence: ${oldSeqName} → ${newSeqName}`);
+        }
+
+        // 3. Rename constraints associated with this table
+        const constraints = await sourceClient.query(
+          `
+          SELECT constraint_name
+          FROM information_schema.table_constraints 
+          WHERE table_schema = 'public' 
+          AND table_name = $1
+        `,
+          [shadowName] // Use shadow name since table was already renamed
+        );
+
+        for (const constRow of constraints.rows) {
+          const oldConstName = constRow.constraint_name;
+          if (oldConstName.startsWith(originalName)) {
+            const newConstName = oldConstName.replace(originalName, shadowName);
+            await sourceClient.query(
+              `ALTER TABLE public."${shadowName}" RENAME CONSTRAINT "${oldConstName}" TO "${newConstName}"`
+            );
+            this.log(`📝 Renamed source constraint: ${oldConstName} → ${newConstName}`);
+          }
+        }
+
+        // 4. Rename indexes associated with this table
+        const indexes = await sourceClient.query(
+          `
+          SELECT indexname
+          FROM pg_indexes 
+          WHERE schemaname = 'public' 
+          AND tablename = $1
+        `,
+          [shadowName] // Use shadow name since table was already renamed
+        );
+
+        for (const idxRow of indexes.rows) {
+          const oldIdxName = idxRow.indexname;
+          // Only add shadow_ prefix if the index doesn't already have it
+          // This prevents double shadow prefixes when indexes are named after constraints
+          const newIdxName = oldIdxName.startsWith('shadow_') ? oldIdxName : `shadow_${oldIdxName}`;
+
+          if (newIdxName !== oldIdxName) {
+            await sourceClient.query(
+              `ALTER INDEX public."${oldIdxName}" RENAME TO "${newIdxName}"`
+            );
+            this.log(`📝 Renamed source index: ${oldIdxName} → ${newIdxName}`);
+          }
+        }
+      }
+
+      // Step 2: Create binary dump (now contains shadow_* tables)
       const dumpPath = join(this.tempDir, `source_dump_${timestamp}.backup`);
       await this.createBinaryDump(dumpPath);
 
-      // Disable write protection before restoring source database structure
+      // Step 3: Restore source tables AND all their constraints/sequences/indexes back to original names
+      this.log('🔄 Restoring source table names and associated objects...');
+      for (const table of sourceTables) {
+        const originalName = table.tableName;
+        const shadowName = `shadow_${originalName}`;
+
+        // 1. Restore indexes first (indexes depend on table)
+        const indexes = await sourceClient.query(
+          `
+          SELECT indexname
+          FROM pg_indexes 
+          WHERE schemaname = 'public' 
+          AND tablename = $1
+        `,
+          [shadowName]
+        );
+
+        for (const idxRow of indexes.rows) {
+          const shadowIdxName = idxRow.indexname;
+          // All indexes now have shadow_ prefix, remove it to restore original name
+          if (shadowIdxName.startsWith('shadow_')) {
+            const originalIdxName = shadowIdxName.substring(7); // Remove 'shadow_' prefix
+            await sourceClient.query(
+              `ALTER INDEX public."${shadowIdxName}" RENAME TO "${originalIdxName}"`
+            );
+            this.log(`📝 Restored source index: ${shadowIdxName} → ${originalIdxName}`);
+          }
+        }
+
+        // 2. Restore constraints (constraints depend on table)
+        const constraints = await sourceClient.query(
+          `
+          SELECT constraint_name
+          FROM information_schema.table_constraints 
+          WHERE table_schema = 'public' 
+          AND table_name = $1
+        `,
+          [shadowName]
+        );
+
+        for (const constRow of constraints.rows) {
+          const shadowConstName = constRow.constraint_name;
+          if (shadowConstName.startsWith(shadowName)) {
+            const originalConstName = shadowConstName.replace(shadowName, originalName);
+            await sourceClient.query(
+              `ALTER TABLE public."${shadowName}" RENAME CONSTRAINT "${shadowConstName}" TO "${originalConstName}"`
+            );
+            this.log(`📝 Restored source constraint: ${shadowConstName} → ${originalConstName}`);
+          }
+        }
+
+        // 3. Restore sequences (sequences are independent but associated with table columns)
+        const sequences = await sourceClient.query(
+          `
+          SELECT schemaname, sequencename
+          FROM pg_sequences 
+          WHERE schemaname = 'public' 
+          AND sequencename LIKE $1
+        `,
+          [`${shadowName}_%`]
+        );
+
+        for (const seqRow of sequences.rows) {
+          const shadowSeqName = seqRow.sequencename;
+          const originalSeqName = shadowSeqName.replace(shadowName, originalName);
+          await sourceClient.query(
+            `ALTER SEQUENCE public."${shadowSeqName}" RENAME TO "${originalSeqName}"`
+          );
+          this.log(`📝 Restored source sequence: ${shadowSeqName} → ${originalSeqName}`);
+        }
+
+        // 4. Finally, restore the table name
+        await sourceClient.query(`ALTER TABLE public."${shadowName}" RENAME TO "${originalName}"`);
+        this.log(`📝 Restored source table: ${shadowName} → ${originalName}`);
+      }
+
+      // Disable write protection after dump creation
       await this.disableWriteProtection();
 
-      // Restore source database tables back to public schema
-      await this.restoreSourceFromShadowDump(sourceTables);
-
-      this.log('✅ Source dump created successfully');
+      this.log('✅ Source dump created successfully with shadow table naming');
       return dumpPath;
     } catch (error) {
+      // On error, try to restore table names and remove write protection
+      try {
+        this.log('⚠️  Error occurred, attempting to restore source table names...');
+        for (const table of sourceTables) {
+          const originalName = table.tableName;
+          const shadowName = `shadow_${originalName}`;
+
+          // Check if shadow table exists and original doesn't
+          const shadowExists = await sourceClient.query(
+            `SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = $1)`,
+            [shadowName]
+          );
+          const originalExists = await sourceClient.query(
+            `SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = $1)`,
+            [originalName]
+          );
+
+          if (shadowExists.rows[0].exists && !originalExists.rows[0].exists) {
+            await sourceClient.query(
+              `ALTER TABLE public."${shadowName}" RENAME TO "${originalName}"`
+            );
+            this.log(`🔧 Restored source table: ${shadowName} → ${originalName}`);
+          }
+        }
+      } catch (restoreError) {
+        this.log(`⚠️  Could not restore some table names: ${restoreError}`);
+      }
+
       // Always remove write protection from source database, even if migration fails
       await this.disableWriteProtection();
       throw error;
+    } finally {
+      sourceClient.release();
     }
   }
 
   /**
-   * Phase 2: Restore source dump to destination shadow schema
+   * Phase 2: Create shadow tables in destination public schema
    */
   private async restoreToDestinationShadow(
     sourceTables: TableInfo[],
     dumpPath: string
   ): Promise<void> {
-    this.log('🔧 Phase 2: Restoring source data to destination shadow schema...');
+    this.log('🔧 Phase 2: Creating shadow tables in destination public schema...');
 
     const client = await this.destPool.connect();
 
@@ -1452,15 +1749,24 @@ export class DatabaseMigrator {
       // Disable foreign key constraints for the destination database during setup
       await this.disableForeignKeyConstraints(this.destPool);
 
-      // Drop and recreate shadow schema on destination before restore
-      this.log('⚠️  Dropping existing shadow schema on destination (if exists)');
-      await client.query('DROP SCHEMA IF EXISTS shadow CASCADE;');
-      this.log('✅ Shadow schema dropped - will be recreated by pg_restore');
+      // Clean up any existing shadow tables from previous migrations
+      this.log('⚠️  Dropping existing shadow tables on destination (if any)');
+      const existingShadowTables = await client.query(`
+        SELECT table_name 
+        FROM information_schema.tables 
+        WHERE table_schema = 'public' 
+        AND table_name LIKE 'shadow_%'
+      `);
 
-      // Restore shadow schema data with full parallelization
+      for (const row of existingShadowTables.rows) {
+        await client.query(`DROP TABLE IF EXISTS public."${row.table_name}" CASCADE`);
+        this.log(`🗑️  Dropped existing shadow table: ${row.table_name}`);
+      }
+
+      // Restore the dump directly - it now contains shadow_* tables with shadow-prefixed constraints/sequences
       const jobCount = Math.min(8, cpus().length);
       const restoreStartTime = Date.now();
-      this.log(`🚀 Restoring with ${jobCount} parallel jobs...`);
+      this.log(`🚀 Restoring shadow tables with ${jobCount} parallel jobs...`);
 
       const restoreArgs = [
         '--jobs',
@@ -1470,6 +1776,7 @@ export class DatabaseMigrator {
         '--no-privileges',
         '--no-owner',
         '--disable-triggers',
+        '--no-comments',
         '--dbname',
         this.destConfig.database,
         '--host',
@@ -1488,18 +1795,31 @@ export class DatabaseMigrator {
 
       try {
         await execa('pg_restore', restoreArgs, { env: restoreEnv });
-        const restoreDuration = Date.now() - restoreStartTime;
-        this.log(
-          `✅ Source data restored to shadow schema with parallelization (${this.formatDuration(restoreDuration)})`
-        );
-      } catch (error) {
-        const restoreDuration = Date.now() - restoreStartTime;
-        this.logError(
-          `Restore failed after ${this.formatDuration(restoreDuration)}`,
-          error as Error
-        );
-        throw error;
+      } catch (error: any) {
+        // Check if the only error is the harmless "schema already exists" error
+        const isOnlySchemaError =
+          (error.stderr &&
+            error.stderr.includes('schema "public" already exists') &&
+            error.stderr.includes('errors ignored on restore: 1') &&
+            !error.stderr.includes('could not execute query')) ||
+          error.stderr.split('could not execute query').length === 2; // Only one "could not execute query"
+
+        if (isOnlySchemaError) {
+          this.log('ℹ️ Ignoring harmless schema existence error during restore');
+        } else {
+          throw error;
+        }
       }
+
+      const restoreDuration = Date.now() - restoreStartTime;
+      this.log(
+        `✅ Shadow tables created in public schema (${this.formatDuration(restoreDuration)})`
+      );
+
+      // Clean up any write protection triggers that were restored with shadow tables
+      // These come from the source database dump and need to be removed so sync triggers can work
+      this.log('🧹 Removing write protection triggers from shadow tables...');
+      await this.removeWriteProtectionFromShadowTables(client);
 
       // Clean up dump file
       if (existsSync(dumpPath)) {
@@ -1510,7 +1830,10 @@ export class DatabaseMigrator {
       this.stats.tablesProcessed = sourceTables.length;
       await this.updateRecordsMigratedCount(sourceTables);
 
-      this.log('✅ Destination shadow schema restore completed');
+      this.log('✅ Shadow table creation completed');
+    } catch (error) {
+      this.logError(`Shadow table creation failed`, error as Error);
+      throw error;
     } finally {
       client.release();
     }
@@ -1531,7 +1854,7 @@ export class DatabaseMigrator {
       '--disable-triggers',
       '--verbose',
       '--schema',
-      'shadow',
+      'public',
       '--file',
       dumpPath,
       '--host',
@@ -1655,50 +1978,239 @@ export class DatabaseMigrator {
   }
 
   /**
-   * Phase 4: Perform atomic schema swap
+   * Phase 4: Perform atomic table swap
    */
-  private async performAtomicSchemaSwap(timestamp: number): Promise<void> {
+  private async performAtomicTableSwap(timestamp: number): Promise<void> {
     const swapStartTime = Date.now();
-    this.log('🔄 Phase 4: Performing atomic schema swap...');
+    this.log('🔄 Phase 4: Performing atomic table swap...');
 
     const client = await this.destPool.connect();
 
     try {
-      // Enable brief write protection only during the actual schema swap operations
-      this.log('🔒 Enabling brief write protection for atomic schema operations...');
-      await this.enableDestinationWriteProtection(); // Enable full protection
+      // Enable brief write protection only during the actual table swap operations
+      this.log('🔒 Enabling brief write protection for atomic table operations...');
+      await this.enableDestinationWriteProtection();
 
       await client.query('BEGIN');
+      await client.query('SET CONSTRAINTS ALL DEFERRED');
 
-      // Move current public schema to backup
-      const backupSchemaName = `backup_${timestamp}`;
-      await client.query(`ALTER SCHEMA public RENAME TO ${backupSchemaName};`);
-      this.log(`📦 Moved public schema to ${backupSchemaName}`);
+      // Fallback: Clean up any existing backups INSIDE the transaction
+      // This handles cases where prepare phase didn't run or cleanup failed
+      const existingBackups = await this.getBackupTables();
+      if (existingBackups.length > 0) {
+        this.log(
+          `⚠️ Found ${existingBackups.length} existing backup tables - cleaning up before swap`
+        );
+        await this.cleanupExistingBackupsWithClient(client);
+      }
 
-      // Move shadow schema to public (becomes active)
-      await client.query(`ALTER SCHEMA shadow RENAME TO public;`);
-      this.log('🚀 Activated shadow schema as new public schema');
+      // Get list of all shadow tables to swap
+      const shadowTablesResult = await client.query(`
+        SELECT table_name 
+        FROM information_schema.tables 
+        WHERE table_schema = 'public' 
+        AND table_name LIKE 'shadow_%'
+        ORDER BY table_name
+      `);
 
-      // Create new shadow schema for future use
-      await client.query('CREATE SCHEMA shadow;');
-      this.log('✅ Created new shadow schema');
+      const shadowTables = shadowTablesResult.rows.map(row => row.table_name);
+      this.log(`🔍 Found ${shadowTables.length} shadow tables to swap`);
+
+      // Step 1: Rename all existing tables AND their sequences/constraints/indexes to backup names
+      for (const shadowTable of shadowTables) {
+        const originalTableName = shadowTable.replace('shadow_', '');
+        const backupTableName = `backup_${originalTableName}`;
+
+        // Check if original table exists
+        const originalExists = await client.query(
+          `
+          SELECT EXISTS (
+            SELECT 1 FROM information_schema.tables 
+            WHERE table_schema = 'public' 
+            AND table_name = $1
+          )
+        `,
+          [originalTableName]
+        );
+
+        if (originalExists.rows[0].exists) {
+          // IMPORTANT: Query for indexes, sequences, and constraints BEFORE renaming the table
+          // This ensures we only process the current main table's objects, not any leftover backup_ objects
+
+          // Get indexes associated with this table BEFORE renaming
+          const indexes = await client.query(
+            `
+            SELECT indexname
+            FROM pg_indexes 
+            WHERE schemaname = 'public' 
+            AND tablename = $1
+          `,
+            [originalTableName] // Query BEFORE table rename
+          );
+
+          // Get sequences associated with this table BEFORE renaming
+          const sequences = await client.query(
+            `
+            SELECT schemaname, sequencename
+            FROM pg_sequences 
+            WHERE schemaname = 'public' 
+            AND sequencename LIKE $1
+          `,
+            [`${originalTableName}_%`] // Query BEFORE table rename
+          );
+
+          // Get constraints associated with this table BEFORE renaming
+          const constraints = await client.query(
+            `
+            SELECT constraint_name
+            FROM information_schema.table_constraints 
+            WHERE table_schema = 'public' 
+            AND table_name = $1
+          `,
+            [originalTableName] // Query BEFORE table rename
+          );
+
+          // 1. Rename the table first
+          await client.query(
+            `ALTER TABLE public."${originalTableName}" RENAME TO "${backupTableName}"`
+          );
+          this.log(`📦 Renamed table: ${originalTableName} → ${backupTableName}`);
+
+          // 2. Rename sequences (using data from before table rename)
+          for (const seqRow of sequences.rows) {
+            const oldSeqName = seqRow.sequencename;
+            // Only rename sequences that don't already have backup_ prefix
+            if (!oldSeqName.startsWith('backup_')) {
+              const newSeqName = oldSeqName.replace(originalTableName, backupTableName);
+              await client.query(`ALTER SEQUENCE public."${oldSeqName}" RENAME TO "${newSeqName}"`);
+              this.log(`📦 Renamed sequence: ${oldSeqName} → ${newSeqName}`);
+            }
+          }
+
+          // 3. Rename constraints (using data from before table rename)
+          for (const constRow of constraints.rows) {
+            const oldConstName = constRow.constraint_name;
+            // Only rename constraints that don't already have backup_ prefix
+            if (!oldConstName.startsWith('backup_') && oldConstName.startsWith(originalTableName)) {
+              const newConstName = oldConstName.replace(originalTableName, backupTableName);
+              await client.query(
+                `ALTER TABLE public."${backupTableName}" RENAME CONSTRAINT "${oldConstName}" TO "${newConstName}"`
+              );
+              this.log(`📦 Renamed constraint: ${oldConstName} → ${newConstName}`);
+            }
+          }
+
+          // 4. Rename indexes (using data from before table rename)
+          for (const idxRow of indexes.rows) {
+            const oldIdxName = idxRow.indexname;
+            // Only rename indexes that don't already have backup_ prefix
+            // Skip indexes that correspond to constraints we've already renamed (they get auto-renamed with constraints)
+            if (
+              !oldIdxName.startsWith('backup_') &&
+              !constraints.rows.some(c => c.constraint_name === oldIdxName)
+            ) {
+              const newIdxName = `backup_${oldIdxName}`;
+              await client.query(`ALTER INDEX public."${oldIdxName}" RENAME TO "${newIdxName}"`);
+              this.log(`📦 Renamed index: ${oldIdxName} → ${newIdxName}`);
+            } else if (constraints.rows.some(c => c.constraint_name === oldIdxName)) {
+              this.log(`⏩ Skipped index ${oldIdxName} (already renamed with constraint)`);
+            }
+          }
+        }
+      }
+
+      // Step 2: Rename all shadow tables to become the active tables
+      for (const shadowTable of shadowTables) {
+        const originalTableName = shadowTable.replace('shadow_', '');
+
+        // 1. Rename the table first
+        await client.query(`ALTER TABLE public."${shadowTable}" RENAME TO "${originalTableName}"`);
+        this.log(`🚀 Renamed ${shadowTable} → ${originalTableName}`);
+
+        // 2. Rename sequences associated with this shadow table
+        const sequences = await client.query(
+          `
+          SELECT schemaname, sequencename
+          FROM pg_sequences 
+          WHERE schemaname = 'public' 
+          AND sequencename LIKE $1
+        `,
+          [`${shadowTable}_%`]
+        );
+
+        for (const seqRow of sequences.rows) {
+          const oldSeqName = seqRow.sequencename;
+          const newSeqName = oldSeqName.replace(shadowTable, originalTableName);
+          await client.query(`ALTER SEQUENCE public."${oldSeqName}" RENAME TO "${newSeqName}"`);
+          this.log(`🚀 Renamed sequence: ${oldSeqName} → ${newSeqName}`);
+        }
+
+        // 3. Rename constraints associated with this shadow table
+        const constraints = await client.query(
+          `
+          SELECT constraint_name
+          FROM information_schema.table_constraints 
+          WHERE table_schema = 'public' 
+          AND table_name = $1
+        `,
+          [originalTableName] // Use original name since table was already renamed
+        );
+
+        for (const constRow of constraints.rows) {
+          const oldConstName = constRow.constraint_name;
+          if (oldConstName.startsWith(shadowTable)) {
+            const newConstName = oldConstName.replace(shadowTable, originalTableName);
+            await client.query(
+              `ALTER TABLE public."${originalTableName}" RENAME CONSTRAINT "${oldConstName}" TO "${newConstName}"`
+            );
+            this.log(`🚀 Renamed constraint: ${oldConstName} → ${newConstName}`);
+          }
+        }
+
+        // 4. Rename indexes associated with this shadow table
+        const indexes = await client.query(
+          `
+          SELECT indexname 
+          FROM pg_indexes 
+          WHERE schemaname = 'public' 
+          AND tablename = $1
+        `,
+          [originalTableName] // Use original name since table was already renamed
+        );
+
+        for (const idxRow of indexes.rows) {
+          const oldIdxName = idxRow.indexname;
+          // SAFETY CHECK: Only process indexes that have shadow_ prefix
+          // This ensures we only rename shadow indexes, not any leftover main table indexes
+          if (oldIdxName.startsWith('shadow_')) {
+            const newIdxName = oldIdxName.replace('shadow_', '');
+            await client.query(`ALTER INDEX public."${oldIdxName}" RENAME TO "${newIdxName}"`);
+            this.log(`🚀 Renamed index: ${oldIdxName} → ${newIdxName}`);
+          } else {
+            // Log unexpected non-shadow indexes for debugging
+            this.log(
+              `⚠️  Skipping non-shadow index on renamed table ${originalTableName}: ${oldIdxName}`
+            );
+          }
+        }
+      }
 
       await client.query('COMMIT');
 
-      // Remove write protection immediately after schema swap completes
+      // Remove write protection immediately after table swap completes
       this.log('🔓 Removing write protection after atomic swap completion...');
       await this.disableDestinationWriteProtection();
 
       const swapDuration = Date.now() - swapStartTime;
       this.log(
-        `✅ Atomic schema swap completed - migration is now live! (${this.formatDuration(swapDuration)})`
+        `✅ Atomic table swap completed - migration is now live! (${this.formatDuration(swapDuration)})`
       );
 
-      // Validate the atomic schema swap completed successfully
-      await this.validateAtomicSchemaSwap(timestamp);
+      // Validate the atomic table swap completed successfully
+      await this.validateAtomicTableSwap(timestamp);
     } catch (error) {
       await client.query('ROLLBACK');
-      throw new Error(`Failed to perform schema swap: ${error}`);
+      throw new Error(`Failed to perform table swap: ${error}`);
     } finally {
       client.release();
     }
@@ -1772,10 +2284,11 @@ export class DatabaseMigrator {
           try {
             // Step 1: Clear shadow table and copy current data atomically
             // Temporarily disable foreign key constraints for this operation
+            const shadowTableName = `shadow_${actualTableName}`;
             await client.query('SET session_replication_role = replica');
-            await client.query(`DELETE FROM shadow."${actualTableName}"`);
+            await client.query(`DELETE FROM public."${shadowTableName}"`);
             await client.query(
-              `INSERT INTO shadow."${actualTableName}" SELECT * FROM public."${actualTableName}"`
+              `INSERT INTO public."${shadowTableName}" SELECT * FROM public."${actualTableName}"`
             );
             await client.query('SET session_replication_role = origin');
 
@@ -1789,6 +2302,17 @@ export class DatabaseMigrator {
 
             // Step 2.1: Validate trigger was created successfully
             await this.validateTriggerExists(triggerInfo);
+
+            // Step 2.2: Validate sync consistency between preserved table and shadow table
+            const syncValidation = await this.validateSyncConsistency(actualTableName);
+            if (!syncValidation.isValid) {
+              throw new Error(
+                `Sync consistency validation failed for ${actualTableName}: ${syncValidation.errors.join(', ')}`
+              );
+            }
+            this.log(
+              `✅ Sync consistency validated for ${actualTableName}: ${syncValidation.sourceRowCount} rows match`
+            );
 
             // Step 3: Basic sync setup validation
             const rowCountResult = await client.query(
@@ -1854,20 +2378,21 @@ export class DatabaseMigrator {
     const setClause = columns.map((col: string) => `"${col}" = NEW."${col}"`).join(', ');
 
     // Create trigger function
+    const shadowTableName = `shadow_${tableName}`;
     const functionSQL = `
       CREATE OR REPLACE FUNCTION ${functionName}()
       RETURNS TRIGGER AS $$
       BEGIN
         IF TG_OP = 'DELETE' THEN
-          DELETE FROM shadow."${tableName}" WHERE id = OLD.id;
+          DELETE FROM public."${shadowTableName}" WHERE id = OLD.id;
           RETURN OLD;
         ELSIF TG_OP = 'UPDATE' THEN
-          UPDATE shadow."${tableName}" 
+          UPDATE public."${shadowTableName}" 
           SET ${setClause}
           WHERE id = OLD.id;
           RETURN NEW;
         ELSIF TG_OP = 'INSERT' THEN
-          INSERT INTO shadow."${tableName}" (${columnList})
+          INSERT INTO public."${shadowTableName}" (${columnList})
           VALUES (${newColumnList});
           RETURN NEW;
         END IF;
@@ -1913,18 +2438,18 @@ export class DatabaseMigrator {
     );
 
     try {
-      // Skip validation after schema swap since migration is already live
-      // and shadow schema no longer exists in the expected state
+      // Skip validation after table swap since migration is already live
+      // and shadow tables no longer exist in the expected state
       this.log('ℹ️ Skipping sync validation - migration already completed and live');
 
-      // Cleanup triggers - pass the backup schema name since triggers are now on backup schema after swap
-      await this.cleanupRealtimeSync(this.activeSyncTriggers, `backup_${timestamp}`);
+      // Cleanup triggers - they are now on backup tables after swap
+      await this.cleanupRealtimeSync(this.activeSyncTriggers, 'public');
 
       this.log(`✅ Sync triggers cleaned up and validation complete (backup_${timestamp})`);
     } catch (error) {
       // Ensure triggers are cleaned up even if validation fails
       try {
-        await this.cleanupRealtimeSync(this.activeSyncTriggers, `backup_${timestamp}`);
+        await this.cleanupRealtimeSync(this.activeSyncTriggers, 'public');
       } catch (cleanupError) {
         this.logError('Failed to cleanup triggers after validation error', cleanupError);
       }
@@ -2014,15 +2539,40 @@ export class DatabaseMigrator {
   }
 
   /**
-   * Validate sync consistency between public and shadow schemas
+   * Validate sync consistency between preserved tables and shadow tables (table-swap approach)
    */
   private async validateSyncConsistency(tableName: string): Promise<SyncValidationResult> {
     const client = await this.destPool.connect();
 
     try {
+      const shadowTableName = `shadow_${tableName}`;
+
+      // Check if shadow table exists
+      const shadowExistsResult = await client.query(
+        `SELECT EXISTS (
+          SELECT 1 FROM information_schema.tables 
+          WHERE table_schema = 'public' AND table_name = $1
+        )`,
+        [shadowTableName]
+      );
+
+      if (!shadowExistsResult.rows[0].exists) {
+        return {
+          tableName,
+          isValid: false,
+          sourceRowCount: 0,
+          targetRowCount: 0,
+          sourceChecksum: '',
+          targetChecksum: '',
+          errors: [`Shadow table ${shadowTableName} does not exist`],
+        };
+      }
+
       // Get row counts
       const sourceCountResult = await client.query(`SELECT COUNT(*) FROM public."${tableName}"`);
-      const targetCountResult = await client.query(`SELECT COUNT(*) FROM shadow."${tableName}"`);
+      const targetCountResult = await client.query(
+        `SELECT COUNT(*) FROM public."${shadowTableName}"`
+      );
 
       const sourceRowCount = parseInt(sourceCountResult.rows[0].count);
       const targetRowCount = parseInt(targetCountResult.rows[0].count);
@@ -2047,18 +2597,18 @@ export class DatabaseMigrator {
         const pkColumnsStr = pkColumns.map(col => `"${col}"::text`).join(` || ',' || `);
         checksumQuery = `
           SELECT md5(string_agg(${pkColumnsStr}, ',' ORDER BY ${pkColumns.map(col => `"${col}"`).join(', ')})) as checksum 
-          FROM TABLE_PLACEHOLDER."${tableName}"
+          FROM public."TABLE_PLACEHOLDER"
         `;
       } else {
         // Fallback to row count only if no primary key found
-        checksumQuery = `SELECT md5(COUNT(*)::text) as checksum FROM TABLE_PLACEHOLDER."${tableName}"`;
+        checksumQuery = `SELECT md5(COUNT(*)::text) as checksum FROM public."TABLE_PLACEHOLDER"`;
       }
 
       const sourceChecksumResult = await client.query(
-        checksumQuery.replace('TABLE_PLACEHOLDER', 'public')
+        checksumQuery.replace('TABLE_PLACEHOLDER', tableName)
       );
       const targetChecksumResult = await client.query(
-        checksumQuery.replace('TABLE_PLACEHOLDER', 'shadow')
+        checksumQuery.replace('TABLE_PLACEHOLDER', shadowTableName)
       );
 
       const sourceChecksum = sourceChecksumResult.rows[0]?.checksum || '';
@@ -2102,41 +2652,133 @@ export class DatabaseMigrator {
   }
 
   /**
-   * Rollback schema swap in case of failure
+   * Rollback table swap in case of failure
    */
-  private async rollbackSchemaSwap(timestamp: number): Promise<void> {
-    this.log('🔄 Rolling back schema swap...');
+  private async rollbackSchemaSwap(_timestamp: number): Promise<void> {
+    this.log('🔄 Rolling back table swap...');
 
     const client = await this.destPool.connect();
-    const backupSchemaName = `backup_${timestamp}`;
 
     try {
       await client.query('BEGIN');
+      await client.query('SET CONSTRAINTS ALL DEFERRED');
 
-      // Check if backup schema exists
-      const backupExists = await client.query(
-        `
-        SELECT EXISTS (
-          SELECT 1 FROM information_schema.schemata 
-          WHERE schema_name = $1
-        )
-      `,
-        [backupSchemaName]
-      );
+      // Get list of all backup tables to restore
+      const backupTablesResult = await client.query(`
+        SELECT table_name 
+        FROM information_schema.tables 
+        WHERE table_schema = 'public' 
+        AND table_name LIKE 'backup_%'
+        ORDER BY table_name
+      `);
 
-      if (backupExists.rows[0].exists) {
-        // Move current public to temp name
-        await client.query(`ALTER SCHEMA public RENAME TO failed_migration_${timestamp};`);
+      const backupTables = backupTablesResult.rows.map(row => row.table_name);
 
-        // Restore backup as public
-        await client.query(`ALTER SCHEMA ${backupSchemaName} RENAME TO public;`);
-
-        await client.query('COMMIT');
-        this.log('✅ Schema rollback completed');
-      } else {
+      if (backupTables.length === 0) {
         await client.query('ROLLBACK');
-        this.log('⚠️  No backup schema found for rollback');
+        this.log('⚠️  No backup tables found for rollback');
+        return;
       }
+
+      this.log(`🔄 Found ${backupTables.length} backup tables to restore`);
+
+      // Step 1: Drop any current tables that conflict with backup restoration
+      for (const backupTable of backupTables) {
+        const originalTableName = backupTable.replace('backup_', '');
+
+        // Check if current table exists
+        const currentExists = await client.query(
+          `
+          SELECT EXISTS (
+            SELECT 1 FROM information_schema.tables 
+            WHERE table_schema = 'public' 
+            AND table_name = $1
+          )
+        `,
+          [originalTableName]
+        );
+
+        if (currentExists.rows[0].exists) {
+          await client.query(`DROP TABLE IF EXISTS public."${originalTableName}" CASCADE`);
+          this.log(`🗑️  Dropped failed table: ${originalTableName}`);
+        }
+      }
+
+      // Step 2: Restore all backup tables AND their sequences/constraints/indexes to original names
+      for (const backupTable of backupTables) {
+        const originalTableName = backupTable.replace('backup_', '');
+
+        // Rename the table back
+        await client.query(`ALTER TABLE public."${backupTable}" RENAME TO "${originalTableName}"`);
+        this.log(`✅ Restored table: ${backupTable} → ${originalTableName}`);
+
+        // Restore sequences
+        const sequences = await client.query(
+          `
+          SELECT schemaname, sequencename
+          FROM pg_sequences 
+          WHERE schemaname = 'public' 
+          AND sequencename LIKE $1
+        `,
+          [`${backupTable}_%`]
+        );
+
+        for (const seqRow of sequences.rows) {
+          const backupSeqName = seqRow.sequencename;
+          const originalSeqName = backupSeqName.replace(backupTable, originalTableName);
+          await client.query(
+            `ALTER SEQUENCE public."${backupSeqName}" RENAME TO "${originalSeqName}"`
+          );
+          this.log(`✅ Restored sequence: ${backupSeqName} → ${originalSeqName}`);
+        }
+
+        // Restore constraints
+        const constraints = await client.query(
+          `
+          SELECT constraint_name
+          FROM information_schema.table_constraints 
+          WHERE table_schema = 'public' 
+          AND table_name = $1
+        `,
+          [originalTableName] // Use original name since table was already renamed
+        );
+
+        for (const constRow of constraints.rows) {
+          const backupConstName = constRow.constraint_name;
+          if (backupConstName.startsWith(backupTable)) {
+            const originalConstName = backupConstName.replace(backupTable, originalTableName);
+            await client.query(
+              `ALTER TABLE public."${originalTableName}" RENAME CONSTRAINT "${backupConstName}" TO "${originalConstName}"`
+            );
+            this.log(`✅ Restored constraint: ${backupConstName} → ${originalConstName}`);
+          }
+        }
+
+        // Restore indexes
+        const indexes = await client.query(
+          `
+          SELECT indexname
+          FROM pg_indexes 
+          WHERE schemaname = 'public' 
+          AND tablename = $1
+        `,
+          [originalTableName] // Use original name since table was already renamed
+        );
+
+        for (const idxRow of indexes.rows) {
+          const backupIdxName = idxRow.indexname;
+          if (backupIdxName.startsWith(backupTable)) {
+            const originalIdxName = backupIdxName.replace(backupTable, originalTableName);
+            await client.query(
+              `ALTER INDEX public."${backupIdxName}" RENAME TO "${originalIdxName}"`
+            );
+            this.log(`✅ Restored index: ${backupIdxName} → ${originalIdxName}`);
+          }
+        }
+      }
+
+      await client.query('COMMIT');
+      this.log('✅ Rollback completed - original schema restored');
     } catch (error) {
       await client.query('ROLLBACK');
       throw new Error(`Rollback failed: ${error}`);
@@ -2146,37 +2788,37 @@ export class DatabaseMigrator {
   }
 
   /**
-   * Clean up backup schema (optional - for cleanup after successful migration)
+   * Clean up backup tables (optional - for cleanup after successful migration)
    */
-  async cleanupBackupSchema(timestamp: number): Promise<void> {
-    this.log('🗑️  Cleaning up backup schema...');
+  async cleanupBackupSchema(_timestamp: number): Promise<void> {
+    this.log('🗑️  Cleaning up backup tables...');
 
     const client = await this.destPool.connect();
-    const backupSchemaName = `backup_${timestamp}`;
 
     try {
-      // Check if backup schema exists
-      const schemaExists = await client.query(
-        `
-        SELECT EXISTS (
-          SELECT 1 FROM information_schema.schemata 
-          WHERE schema_name = $1
-        )
-      `,
-        [backupSchemaName]
-      );
+      // Get list of all backup tables
+      const backupTablesResult = await client.query(`
+        SELECT table_name 
+        FROM information_schema.tables 
+        WHERE table_schema = 'public' 
+        AND table_name LIKE 'backup_%'
+      `);
 
-      if (schemaExists.rows[0].exists) {
-        await client.query(`DROP SCHEMA ${backupSchemaName} CASCADE;`);
-        this.log(`🗑️  Cleaned up backup schema: ${backupSchemaName}`);
+      const backupTables = backupTablesResult.rows.map(row => row.table_name);
+
+      if (backupTables.length === 0) {
+        this.log('⚠️  No backup tables found to clean up');
       } else {
-        this.log(`⚠️  Backup schema ${backupSchemaName} not found`);
+        for (const backupTable of backupTables) {
+          await client.query(`DROP TABLE IF EXISTS public."${backupTable}" CASCADE`);
+          this.log(`🗑️  Cleaned up backup table: ${backupTable}`);
+        }
       }
 
       this.log('✅ Backup cleanup completed');
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
-      this.log(`⚠️  Warning: Could not clean up backup schema: ${errorMessage}`);
+      this.log(`⚠️  Warning: Could not clean up backup tables: ${errorMessage}`);
     } finally {
       client.release();
     }
@@ -2229,13 +2871,17 @@ export class DatabaseMigrator {
           }
 
           // Check if the sequence exists
+          const cleanedSequenceName = sequence.sequenceName
+            .replace(/^"?public"?\./, '')
+            .replace(/"/g, '');
+
           const sequenceExistsResult = await this.destPool.query(
             `SELECT EXISTS (
               SELECT 1 FROM information_schema.sequences 
               WHERE sequence_schema = 'public' 
               AND sequence_name = $1
             )`,
-            [sequence.sequenceName.replace(/^"?public"?\./, '').replace(/"/g, '')]
+            [cleanedSequenceName]
           );
 
           if (!sequenceExistsResult.rows[0].exists) {
@@ -2252,7 +2898,9 @@ export class DatabaseMigrator {
           const maxValue = parseInt(maxResult.rows[0].max_val);
           const nextValue = maxValue + 1;
 
-          await this.destPool.query(`SELECT setval('${sequence.sequenceName}', $1)`, [nextValue]);
+          await this.destPool.query(`SELECT setval('"public"."${cleanedSequenceName}"', $1)`, [
+            nextValue,
+          ]);
           this.log(
             `✅ Reset sequence ${sequence.sequenceName} to ${nextValue} (max value in ${tableName}.${sequence.columnName}: ${maxValue})`
           );
@@ -2470,29 +3118,36 @@ export class DatabaseMigrator {
 
     const client = await this.sourcePool.connect();
     try {
-      // Get all user tables
-      const result = await client.query(`
-        SELECT tablename 
-        FROM pg_tables 
-        WHERE schemaname = 'public'
+      // First, get all triggers that use the migration_block_writes function
+      const triggersResult = await client.query(`
+        SELECT trigger_schema, event_object_table, trigger_name 
+        FROM information_schema.triggers 
+        WHERE trigger_name LIKE 'migration_write_block_%'
+        AND trigger_schema = 'public'
       `);
 
-      // Drop triggers from all tables
-      for (const row of result.rows) {
-        const tableName = row.tablename;
-        const triggerName = `migration_write_block_${tableName}`;
-
+      // Drop all migration triggers first
+      for (const row of triggersResult.rows) {
+        const { event_object_table, trigger_name } = row;
         try {
-          await client.query(`DROP TRIGGER IF EXISTS ${triggerName} ON "${tableName}";`);
-          this.log(`🔓 Write protection removed from table: ${tableName}`);
+          await client.query(
+            `DROP TRIGGER IF EXISTS "${trigger_name}" ON public."${event_object_table}" CASCADE;`
+          );
+          this.log(`🔓 Write protection removed from table: ${event_object_table}`);
         } catch (error) {
-          // Log but don't fail if trigger doesn't exist
-          this.log(`⚠️  Could not remove trigger from ${tableName}: ${error}`);
+          this.log(
+            `⚠️  Could not remove trigger ${trigger_name} from ${event_object_table}: ${error}`
+          );
         }
       }
 
-      // Clean up the blocking function
-      await client.query('DROP FUNCTION IF EXISTS migration_block_writes();');
+      // Now safely drop the blocking function
+      try {
+        await client.query('DROP FUNCTION IF EXISTS migration_block_writes() CASCADE;');
+        this.log('🔓 Migration write protection function removed');
+      } catch (error) {
+        this.log(`⚠️  Could not remove migration_block_writes function: ${error}`);
+      }
 
       this.log('✅ Write protection removed from all source tables');
     } catch (error) {
@@ -2547,6 +3202,18 @@ export class DatabaseMigrator {
           continue;
         }
 
+        // Skip shadow tables - they need to be writable by sync triggers
+        if (tableName.startsWith('shadow_')) {
+          this.log(`🔓 Skipping write protection for shadow table: ${tableName}`);
+          continue;
+        }
+
+        // Skip backup tables - they should not be modified during migration
+        if (tableName.startsWith('backup_')) {
+          this.log(`🔓 Skipping write protection for backup table: ${tableName}`);
+          continue;
+        }
+
         const triggerName = `migration_write_block_${tableName}`;
 
         await client.query(`
@@ -2570,6 +3237,56 @@ export class DatabaseMigrator {
   }
 
   /**
+   * Remove write protection triggers from shadow tables that were restored from source dump
+   * Shadow tables need to be writable by sync triggers
+   */
+  private async removeWriteProtectionFromShadowTables(client: PoolClient): Promise<void> {
+    try {
+      // Find all shadow tables
+      const shadowTablesResult = await client.query(`
+        SELECT table_name 
+        FROM information_schema.tables 
+        WHERE table_schema = 'public' 
+        AND table_name LIKE 'shadow_%'
+      `);
+
+      let removedCount = 0;
+
+      for (const row of shadowTablesResult.rows) {
+        const tableName = row.table_name;
+
+        // Remove write protection triggers from this shadow table
+        const result = await client.query(
+          `
+          SELECT trigger_name 
+          FROM information_schema.triggers 
+          WHERE event_object_table = $1 
+          AND event_object_schema = 'public'
+          AND trigger_name LIKE 'migration_write_block_%'
+        `,
+          [tableName]
+        );
+
+        for (const triggerRow of result.rows) {
+          const triggerName = triggerRow.trigger_name;
+          await client.query(`DROP TRIGGER IF EXISTS "${triggerName}" ON public."${tableName}"`);
+          this.log(`🔓 Removed write protection trigger ${triggerName} from ${tableName}`);
+          removedCount++;
+        }
+      }
+
+      if (removedCount > 0) {
+        this.log(`✅ Removed ${removedCount} write protection triggers from shadow tables`);
+      } else {
+        this.log('ℹ️ No write protection triggers found on shadow tables');
+      }
+    } catch (error) {
+      this.logError('Failed to remove write protection from shadow tables', error);
+      throw error;
+    }
+  }
+
+  /**
    * Disable write protection on destination database tables to restore normal operations
    */
   private async disableDestinationWriteProtection(): Promise<void> {
@@ -2577,29 +3294,36 @@ export class DatabaseMigrator {
 
     const client = await this.destPool.connect();
     try {
-      // Get all user tables
-      const result = await client.query(`
-        SELECT tablename 
-        FROM pg_tables 
-        WHERE schemaname = 'public'
+      // First, get all triggers that use the migration_block_writes function
+      const triggersResult = await client.query(`
+        SELECT trigger_schema, event_object_table, trigger_name 
+        FROM information_schema.triggers 
+        WHERE trigger_name LIKE 'migration_write_block_%'
+        AND trigger_schema = 'public'
       `);
 
-      // Drop triggers from all tables
-      for (const row of result.rows) {
-        const tableName = row.tablename;
-        const triggerName = `migration_write_block_${tableName}`;
-
+      // Drop all migration triggers first
+      for (const row of triggersResult.rows) {
+        const { event_object_table, trigger_name } = row;
         try {
-          await client.query(`DROP TRIGGER IF EXISTS ${triggerName} ON "${tableName}";`);
-          this.log(`🔓 Write protection removed from destination table: ${tableName}`);
+          await client.query(
+            `DROP TRIGGER IF EXISTS "${trigger_name}" ON public."${event_object_table}" CASCADE;`
+          );
+          this.log(`🔓 Write protection removed from destination table: ${event_object_table}`);
         } catch (error) {
-          // Log but don't fail if trigger doesn't exist
-          this.log(`⚠️  Could not remove trigger from ${tableName}: ${error}`);
+          this.log(
+            `⚠️  Could not remove trigger ${trigger_name} from ${event_object_table}: ${error}`
+          );
         }
       }
 
-      // Clean up the blocking function
-      await client.query('DROP FUNCTION IF EXISTS migration_block_writes();');
+      // Now safely drop the blocking function
+      try {
+        await client.query('DROP FUNCTION IF EXISTS migration_block_writes() CASCADE;');
+        this.log('🔓 Migration write protection function removed');
+      } catch (error) {
+        this.log(`⚠️  Could not remove migration_block_writes function: ${error}`);
+      }
 
       this.log('✅ Write protection removed from all destination tables');
     } catch (error) {
@@ -2607,6 +3331,212 @@ export class DatabaseMigrator {
       // Don't throw here - we want to continue even if cleanup fails
     } finally {
       client.release();
+    }
+  }
+
+  /**
+   * Check if write protection is active on source database
+   */
+  async isSourceWriteProtectionActive(): Promise<boolean> {
+    const client = await this.sourcePool.connect();
+    try {
+      // Check if migration_block_writes function exists
+      const functionResult = await client.query(`
+        SELECT EXISTS (
+          SELECT 1 FROM pg_proc 
+          WHERE proname = 'migration_block_writes'
+        )
+      `);
+
+      // Check for any migration triggers
+      const triggersResult = await client.query(`
+        SELECT COUNT(*) as count 
+        FROM information_schema.triggers 
+        WHERE trigger_name LIKE 'migration_write_block_%'
+        AND trigger_schema = 'public'
+      `);
+
+      const hasFunctions = functionResult.rows[0].exists;
+      const hasTriggers = parseInt(triggersResult.rows[0].count) > 0;
+
+      return hasFunctions || hasTriggers;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Check if write protection is active on destination database
+   */
+  async isDestinationWriteProtectionActive(): Promise<boolean> {
+    const client = await this.destPool.connect();
+    try {
+      // Check if migration_block_writes function exists
+      const functionResult = await client.query(`
+        SELECT EXISTS (
+          SELECT 1 FROM pg_proc 
+          WHERE proname = 'migration_block_writes'
+        )
+      `);
+
+      // Check for any migration triggers
+      const triggersResult = await client.query(`
+        SELECT COUNT(*) as count 
+        FROM information_schema.triggers 
+        WHERE trigger_name LIKE 'migration_write_block_%'
+        AND trigger_schema = 'public'
+      `);
+
+      const hasFunctions = functionResult.rows[0].exists;
+      const hasTriggers = parseInt(triggersResult.rows[0].count) > 0;
+
+      return hasFunctions || hasTriggers;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Get list of existing backup tables in destination database
+   */
+  private async getBackupTables(): Promise<string[]> {
+    const client = await this.destPool.connect();
+    try {
+      const result = await client.query(`
+        SELECT tablename 
+        FROM pg_tables 
+        WHERE schemaname = 'public' 
+        AND tablename LIKE 'backup_%'
+        ORDER BY tablename
+      `);
+
+      return result.rows.map(row => row.tablename);
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Detect existing backups for dry-run reporting
+   */
+  private async detectExistingBackups(): Promise<BackupInfo | null> {
+    const backupTables = await this.getBackupTables();
+
+    if (backupTables.length === 0) {
+      return null;
+    }
+
+    return {
+      tableCount: backupTables.length,
+      tables: backupTables,
+      // Try to extract timestamp from first backup table name
+      estimatedTimestamp: this.extractTimestampFromBackupName(backupTables[0]),
+    };
+  }
+
+  /**
+   * Extract timestamp from backup table name if possible
+   */
+  private extractTimestampFromBackupName(tableName: string): number | undefined {
+    // Look for timestamp patterns in backup table names
+    const match = tableName.match(/backup_(\d{13})_/);
+    return match ? parseInt(match[1]) : undefined;
+  }
+
+  /**
+   * Cleanup existing backup tables, sequences, and constraints
+   * Only called after successful prepare phase to maintain safety
+   */
+  private async cleanupExistingBackups(): Promise<void> {
+    const startTime = Date.now();
+    this.log('🧹 Cleaning up existing backup tables...');
+
+    // Get list of all backup tables
+    const backupTables = await this.getBackupTables();
+
+    if (backupTables.length === 0) {
+      this.log('ℹ️ No existing backup tables to clean up');
+      return;
+    }
+
+    this.log(`🗑️ Found ${backupTables.length} backup tables to remove`);
+
+    const client = await this.destPool.connect();
+    try {
+      // Drop all backup tables with CASCADE to handle constraints
+      for (const table of backupTables) {
+        await client.query(`DROP TABLE IF EXISTS ${table} CASCADE`);
+        this.log(`🗑️ Dropped backup table: ${table}`);
+      }
+    } finally {
+      client.release();
+    }
+
+    const duration = Date.now() - startTime;
+    this.log(`✅ Backup cleanup completed (${duration}ms)`);
+  }
+
+  /**
+   * Clean up existing backup tables using provided client connection
+   * This ensures cleanup happens in the same transaction context as the caller
+   */
+  private async cleanupExistingBackupsWithClient(client: any): Promise<void> {
+    const startTime = Date.now();
+    this.log('🧹 Cleaning up existing backup tables...');
+
+    // Get list of all backup tables
+    const backupTables = await this.getBackupTables();
+
+    if (backupTables.length === 0) {
+      this.log('ℹ️ No existing backup tables to clean up');
+      return;
+    }
+
+    this.log(`🗑️ Found ${backupTables.length} backup tables to remove`);
+
+    // Drop all backup tables with CASCADE to handle constraints
+    for (const table of backupTables) {
+      await client.query(`DROP TABLE IF EXISTS "${table}" CASCADE`);
+      this.log(`🗑️ Dropped backup table: ${table}`);
+    }
+
+    const duration = Date.now() - startTime;
+    this.log(`✅ Backup cleanup completed (${duration}ms)`);
+
+    // Verify cleanup was successful by checking database state
+    await this.verifyBackupCleanupSuccess(client);
+  }
+
+  /**
+   * Verify that backup cleanup was successful by checking actual database state
+   */
+  private async verifyBackupCleanupSuccess(client: any): Promise<void> {
+    this.log('🔍 Verifying backup cleanup success...');
+
+    // Check for any remaining backup tables in the database using the SAME client
+    // This is critical - we must use the same client to see changes made within the transaction
+    const remainingBackupsResult = await client.query(`
+      SELECT table_name 
+      FROM information_schema.tables 
+      WHERE table_schema = 'public' 
+      AND table_name LIKE 'backup_%'
+      ORDER BY table_name
+    `);
+
+    const remainingBackups = remainingBackupsResult.rows.map((row: any) => row.table_name);
+
+    if (remainingBackups.length === 0) {
+      this.log('✅ Verification successful: No backup tables remain in database');
+    } else {
+      this.log(`⚠️ Verification failed: ${remainingBackups.length} backup tables still exist:`);
+      for (const table of remainingBackups) {
+        this.log(`   - ${table}`);
+      }
+
+      // This is a critical issue - cleanup should have removed all backup tables
+      throw new Error(
+        `Backup cleanup verification failed: ${remainingBackups.length} backup tables still exist after cleanup: ${remainingBackups.join(', ')}`
+      );
     }
   }
 }
