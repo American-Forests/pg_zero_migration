@@ -3496,7 +3496,7 @@ export class DatabaseMigrator {
 
     // Drop all backup tables with CASCADE to handle constraints
     for (const table of backupTables) {
-      await client.query(`DROP TABLE IF EXISTS ${table} CASCADE`);
+      await client.query(`DROP TABLE IF EXISTS "${table}" CASCADE`);
       this.log(`🗑️ Dropped backup table: ${table}`);
     }
 

@@ -72,7 +72,22 @@ class MigrationManager {
   async listBackups(json: boolean = false): Promise<void> {
     await this.connect();
     try {
-      const backups = await this.getAvailableBackups();
+      let backups: BackupInfo[];
+
+      if (json) {
+        // Temporarily suppress console.log output to prevent contaminating JSON output
+        const originalLog = console.log;
+        console.log = () => {}; // Suppress all console.log calls
+
+        try {
+          backups = await this.getAvailableBackups();
+        } finally {
+          // Restore original console.log
+          console.log = originalLog;
+        }
+      } else {
+        backups = await this.getAvailableBackups();
+      }
 
       if (json) {
         console.log(
@@ -775,13 +790,20 @@ async function handleBackupCommand(
   dryRun: boolean
 ): Promise<void> {
   // Database configuration for single-database backup operations
-  const config: DatabaseConfig = {
-    host: process.env.DB_HOST || 'localhost',
-    port: parseInt(process.env.DB_PORT || '5432'),
-    database: process.env.DB_NAME || 'postgres',
-    user: process.env.DB_USER || 'postgres',
-    password: process.env.DB_PASSWORD || '',
-  };
+  // Use --dest parameter if provided, otherwise fall back to environment variables
+  let config: DatabaseConfig;
+
+  if (values.dest) {
+    config = parseDatabaseUrl(values.dest);
+  } else {
+    config = {
+      host: process.env.DB_HOST || 'localhost',
+      port: parseInt(process.env.DB_PORT || '5432'),
+      database: process.env.DB_NAME || 'postgres',
+      user: process.env.DB_USER || 'postgres',
+      password: process.env.DB_PASSWORD || '',
+    };
+  }
 
   const manager = new MigrationManager(config, dryRun);
 
