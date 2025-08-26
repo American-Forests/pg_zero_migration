@@ -104,6 +104,12 @@ export interface PreparationResult {
   error?: string;
 }
 
+export interface BackupInfo {
+  tableCount: number;
+  tables: string[];
+  estimatedTimestamp?: number;
+}
+
 export class DatabaseMigrator {
   private sourceConfig: DatabaseConfig;
   private destConfig: DatabaseConfig;
@@ -242,6 +248,9 @@ export class DatabaseMigrator {
       await this.doPreparation(sourceTables, destTables, timestamp, migrationId);
 
       this.log('✅ Migration preparation completed successfully');
+
+      // Only cleanup backups after successful prepare to maintain safety
+      await this.cleanupExistingBackups();
 
       return {
         success: true,
@@ -1269,6 +1278,19 @@ export class DatabaseMigrator {
     this.log(`   Destination tables to backup: ${destTables.length}`);
     this.log(`   Preserved tables: ${this.preservedTables.size}`);
 
+    // Check for existing backups
+    const existingBackup = await this.detectExistingBackups();
+    if (existingBackup) {
+      this.log(`\n⚠️  Existing Backup Detected:`);
+      this.log(`   📦 Found ${existingBackup.tableCount} backup tables`);
+      if (existingBackup.estimatedTimestamp) {
+        const backupDate = new Date(existingBackup.estimatedTimestamp).toISOString();
+        this.log(`   📅 Estimated backup date: ${backupDate}`);
+      }
+      this.log(`   📝 Note: Existing backup will be replaced after successful prepare`);
+      this.log(`   ⚠️  Previous backup will be lost - ensure you don't need to rollback to it`);
+    }
+
     // Analyze source tables with real data
     this.log(`\n📋 Source Database Analysis:`);
     let totalSourceRecords = 0;
@@ -1971,6 +1993,16 @@ export class DatabaseMigrator {
 
       await client.query('BEGIN');
       await client.query('SET CONSTRAINTS ALL DEFERRED');
+
+      // Fallback: Clean up any existing backups INSIDE the transaction
+      // This handles cases where prepare phase didn't run or cleanup failed
+      const existingBackups = await this.getBackupTables();
+      if (existingBackups.length > 0) {
+        this.log(
+          `⚠️ Found ${existingBackups.length} existing backup tables - cleaning up before swap`
+        );
+        await this.cleanupExistingBackupsWithClient(client);
+      }
 
       // Get list of all shadow tables to swap
       const shadowTablesResult = await client.query(`
@@ -3361,6 +3393,150 @@ export class DatabaseMigrator {
       return hasFunctions || hasTriggers;
     } finally {
       client.release();
+    }
+  }
+
+  /**
+   * Get list of existing backup tables in destination database
+   */
+  private async getBackupTables(): Promise<string[]> {
+    const client = await this.destPool.connect();
+    try {
+      const result = await client.query(`
+        SELECT tablename 
+        FROM pg_tables 
+        WHERE schemaname = 'public' 
+        AND tablename LIKE 'backup_%'
+        ORDER BY tablename
+      `);
+
+      return result.rows.map(row => row.tablename);
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Detect existing backups for dry-run reporting
+   */
+  private async detectExistingBackups(): Promise<BackupInfo | null> {
+    const backupTables = await this.getBackupTables();
+
+    if (backupTables.length === 0) {
+      return null;
+    }
+
+    return {
+      tableCount: backupTables.length,
+      tables: backupTables,
+      // Try to extract timestamp from first backup table name
+      estimatedTimestamp: this.extractTimestampFromBackupName(backupTables[0]),
+    };
+  }
+
+  /**
+   * Extract timestamp from backup table name if possible
+   */
+  private extractTimestampFromBackupName(tableName: string): number | undefined {
+    // Look for timestamp patterns in backup table names
+    const match = tableName.match(/backup_(\d{13})_/);
+    return match ? parseInt(match[1]) : undefined;
+  }
+
+  /**
+   * Cleanup existing backup tables, sequences, and constraints
+   * Only called after successful prepare phase to maintain safety
+   */
+  private async cleanupExistingBackups(): Promise<void> {
+    const startTime = Date.now();
+    this.log('🧹 Cleaning up existing backup tables...');
+
+    // Get list of all backup tables
+    const backupTables = await this.getBackupTables();
+
+    if (backupTables.length === 0) {
+      this.log('ℹ️ No existing backup tables to clean up');
+      return;
+    }
+
+    this.log(`🗑️ Found ${backupTables.length} backup tables to remove`);
+
+    const client = await this.destPool.connect();
+    try {
+      // Drop all backup tables with CASCADE to handle constraints
+      for (const table of backupTables) {
+        await client.query(`DROP TABLE IF EXISTS ${table} CASCADE`);
+        this.log(`🗑️ Dropped backup table: ${table}`);
+      }
+    } finally {
+      client.release();
+    }
+
+    const duration = Date.now() - startTime;
+    this.log(`✅ Backup cleanup completed (${duration}ms)`);
+  }
+
+  /**
+   * Clean up existing backup tables using provided client connection
+   * This ensures cleanup happens in the same transaction context as the caller
+   */
+  private async cleanupExistingBackupsWithClient(client: any): Promise<void> {
+    const startTime = Date.now();
+    this.log('🧹 Cleaning up existing backup tables...');
+
+    // Get list of all backup tables
+    const backupTables = await this.getBackupTables();
+
+    if (backupTables.length === 0) {
+      this.log('ℹ️ No existing backup tables to clean up');
+      return;
+    }
+
+    this.log(`🗑️ Found ${backupTables.length} backup tables to remove`);
+
+    // Drop all backup tables with CASCADE to handle constraints
+    for (const table of backupTables) {
+      await client.query(`DROP TABLE IF EXISTS ${table} CASCADE`);
+      this.log(`🗑️ Dropped backup table: ${table}`);
+    }
+
+    const duration = Date.now() - startTime;
+    this.log(`✅ Backup cleanup completed (${duration}ms)`);
+
+    // Verify cleanup was successful by checking database state
+    await this.verifyBackupCleanupSuccess(client);
+  }
+
+  /**
+   * Verify that backup cleanup was successful by checking actual database state
+   */
+  private async verifyBackupCleanupSuccess(client: any): Promise<void> {
+    this.log('🔍 Verifying backup cleanup success...');
+
+    // Check for any remaining backup tables in the database using the SAME client
+    // This is critical - we must use the same client to see changes made within the transaction
+    const remainingBackupsResult = await client.query(`
+      SELECT table_name 
+      FROM information_schema.tables 
+      WHERE table_schema = 'public' 
+      AND table_name LIKE 'backup_%'
+      ORDER BY table_name
+    `);
+
+    const remainingBackups = remainingBackupsResult.rows.map((row: any) => row.table_name);
+
+    if (remainingBackups.length === 0) {
+      this.log('✅ Verification successful: No backup tables remain in database');
+    } else {
+      this.log(`⚠️ Verification failed: ${remainingBackups.length} backup tables still exist:`);
+      for (const table of remainingBackups) {
+        this.log(`   - ${table}`);
+      }
+
+      // This is a critical issue - cleanup should have removed all backup tables
+      throw new Error(
+        `Backup cleanup verification failed: ${remainingBackups.length} backup tables still exist after cleanup: ${remainingBackups.join(', ')}`
+      );
     }
   }
 }

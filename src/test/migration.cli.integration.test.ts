@@ -195,9 +195,9 @@ describe('Migration CLI Integration Tests', () => {
     console.log(`✅ Swap command completed without log file creation`);
 
     // ========================================
-    // PHASE 4: List Backups (should show 2)
+    // PHASE 4: List Backups (should show 1)
     // ========================================
-    console.log('\n🔄 PHASE 4: Listing backups (expecting 2)...');
+    console.log('\n🔄 PHASE 4: Listing backups (expecting 1)...');
 
     const listArgs = ['tsx', migrationScript, 'list', '--dest', actualDestUrl, '--json'];
 
@@ -212,22 +212,19 @@ describe('Migration CLI Integration Tests', () => {
     // Parse and verify backup list
     const backupList = JSON.parse(listResult.stdout);
     expect(Array.isArray(backupList)).toBe(true);
-    expect(backupList).toHaveLength(2);
+    expect(backupList).toHaveLength(1); // Only 1 backup since second migration replaced first
 
-    // Verify each backup has expected metadata
-    backupList.forEach((backup: { timestamp: number; tableCount: number }, index: number) => {
-      expect(backup).toHaveProperty('timestamp');
-      expect(backup).toHaveProperty('tableCount');
-      expect(backup.tableCount).toBeGreaterThan(0);
-      console.log(
-        `✅ Backup ${index + 1} validated: timestamp=${backup.timestamp}, tables=${backup.tableCount}`
-      );
-    });
+    // Verify backup has expected metadata
+    const backup = backupList[0];
+    expect(backup).toHaveProperty('timestamp');
+    expect(backup).toHaveProperty('tableCount');
+    expect(backup.tableCount).toBeGreaterThan(0);
+    console.log(`✅ Backup validated: timestamp=${backup.timestamp}, tables=${backup.tableCount}`);
 
     // ========================================
-    // PHASE 5: Rollback (should consume latest backup)
+    // PHASE 5: Rollback (should consume the backup)
     // ========================================
-    console.log('\n🔄 PHASE 5: Rolling back to latest backup...');
+    console.log('\n🔄 PHASE 5: Rolling back to backup...');
 
     const rollbackArgs = ['tsx', migrationScript, 'rollback', '--latest', '--dest', actualDestUrl];
 
@@ -240,9 +237,9 @@ describe('Migration CLI Integration Tests', () => {
     console.log('✅ Rollback completed successfully');
 
     // ========================================
-    // PHASE 6: List Backups Again (should show 1)
+    // PHASE 6: List Backups Again (should show 0)
     // ========================================
-    console.log('\n🔄 PHASE 6: Listing backups after rollback (expecting 1)...');
+    console.log('\n🔄 PHASE 6: Listing backups after rollback (expecting 0)...');
 
     const listAfterRollbackResult = await execa(nodeCommand, listArgs, {
       cwd,
@@ -251,41 +248,14 @@ describe('Migration CLI Integration Tests', () => {
 
     const backupListAfterRollback = JSON.parse(listAfterRollbackResult.stdout);
     expect(Array.isArray(backupListAfterRollback)).toBe(true);
-    expect(backupListAfterRollback).toHaveLength(1);
+    expect(backupListAfterRollback).toHaveLength(0);
 
-    console.log(
-      `✅ One backup remains after rollback: timestamp=${backupListAfterRollback[0].timestamp}`
-    );
+    console.log('✅ No backups remain after rollback');
 
     // ========================================
-    // PHASE 7: Cleanup Remaining Backups
+    // PHASE 7: Verify No Cleanup Needed (should show 0 backups)
     // ========================================
-    console.log('\n🔄 PHASE 7: Cleaning up remaining backup...');
-
-    // Use a future date to ensure cleanup of all backups
-    const futureDate = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
-    const cleanupArgs = [
-      'tsx',
-      migrationScript,
-      'cleanup',
-      '--before',
-      futureDate,
-      '--dest',
-      actualDestUrl,
-    ];
-
-    console.log(`Command: ${nodeCommand} ${cleanupArgs.join(' ')}`);
-    await execa(nodeCommand, cleanupArgs, {
-      cwd,
-      env: { ...process.env, NODE_ENV: 'test' },
-    });
-
-    console.log('✅ Cleanup completed successfully');
-
-    // ========================================
-    // PHASE 8: Final Verification (should show 0 backups)
-    // ========================================
-    console.log('\n🔄 PHASE 8: Final verification (expecting 0 backups)...');
+    console.log('\n🔄 PHASE 7: Final verification (expecting 0 backups)...');
 
     const finalListResult = await execa(nodeCommand, listArgs, {
       cwd,
@@ -296,7 +266,7 @@ describe('Migration CLI Integration Tests', () => {
     expect(Array.isArray(finalBackupList)).toBe(true);
     expect(finalBackupList).toHaveLength(0);
 
-    console.log('✅ All backups successfully cleaned up');
+    console.log('✅ No backups remain - cleanup not needed');
 
     // ========================================
     // FINAL VALIDATION
@@ -309,7 +279,8 @@ describe('Migration CLI Integration Tests', () => {
     console.log(`📊 Summary:`);
     console.log(`   - Log files created: ${totalNewLogFiles.length} (only start command)`);
     console.log(`   - Migrations performed: 2 (1 single-phase + 1 two-phase)`);
-    console.log(`   - Commands tested: start, prepare, swap, list, rollback, cleanup`);
-    console.log(`   - Final backup count: 0`);
+    console.log(`   - Backup behavior: Second migration replaced first backup`);
+    console.log(`   - Commands tested: start, prepare, swap, list, rollback`);
+    console.log(`   - Final backup count: 0 (consumed by rollback)`);
   }, 60000); // 60 second timeout for comprehensive CLI execution
 });
