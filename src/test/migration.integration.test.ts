@@ -2370,6 +2370,10 @@ describe('TES Schema Migration Integration Tests', () => {
     async function captureSourceDatabaseState(label: string): Promise<DatabaseState> {
       console.log(`📊 Capturing source database state: ${label}`);
 
+      if (!sourceLoader) {
+        throw new Error('Source loader not initialized');
+      }
+
       // Get all tables in public schema (excluding system tables)
       const tables = await sourceLoader.executeQuery(`
         SELECT table_name 
@@ -2584,6 +2588,10 @@ describe('TES Schema Migration Integration Tests', () => {
      */
     async function captureDestinationDatabaseState(label: string): Promise<DatabaseState> {
       console.log(`📊 Capturing destination database state: ${label}`);
+
+      if (!destLoader) {
+        throw new Error('Destination loader not initialized');
+      }
 
       // Get all tables in public schema (excluding system tables)
       const tables = await destLoader.executeQuery(`
